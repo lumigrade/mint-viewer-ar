@@ -14,7 +14,9 @@
 </style></head>
 <body>
 <canvas id="c"></canvas>
-<div id="xrOverlay" style="position:fixed;inset:0;pointer-events:none;z-index:7"></div>
+<div id="xrOverlay" style="position:fixed;inset:0;pointer-events:none;z-index:7">
+  <button id="shadowBtn" style="position:absolute;left:14px;top:14px;pointer-events:auto;background:#000b;color:#fff;border:1px solid #fff7;border-radius:22px;padding:10px 18px;font:600 14px system-ui">Shadow: On</button>
+</div>
 <button id="enterAR" style="position:fixed;left:50%;bottom:64px;transform:translateX(-50%);display:none;z-index:10;background:#0cf;color:#012;font:600 17px system-ui;border:0;border-radius:30px;padding:13px 30px;box-shadow:0 4px 18px #0006;cursor:pointer">▶ View in AR</button>
 <div id="arHint" style="position:fixed;left:0;right:0;bottom:14px;text-align:center;color:#fff;font:600 14px system-ui;text-shadow:0 1px 3px #000;display:none;z-index:8;pointer-events:none"></div>
 <div id="load">loading 0%</div>
@@ -197,16 +199,16 @@ out vec2 vPos; out float vA;
 void main(){
   vec3 wp=aCenter+uGroundOff;                                 // grounded splat world pos
   float h=max(0.0,wp.y);                                      // height above ground
-  vec2 sxz=wp.xz + h*uSunOff;                                 // PROJECT along the sun dir onto y=0 (angled shadow)
-  float r=max(aScale.x,aScale.z)*1.3+uBlur+h*0.015;          // TIGHT footprint (sharp silhouette), tiny penumbra growth
-  vec3 g=vec3(sxz.x+aQuad.x*r, uShadowY, sxz.y+aQuad.y*r);    // world-space soft disc at the projected position
+  vec2 sxz=wp.xz + h*uSunOff;                                 // PROJECT along the sun dir onto y=0 (angled cast shadow)
+  float r=max(aScale.x,aScale.z)*1.15+uBlur;                 // TIGHT footprint (no height growth -> silhouette not ballooned)
+  vec3 g=vec3(sxz.x+aQuad.x*r, uShadowY, sxz.y+aQuad.y*r);    // small disc at the projected position; union = the silhouette
   vec4 cl=uProj*uView*vec4(g,1.0);
-  gl_Position=cl; vPos=aQuad; vA=aOpa/(1.0+h*0.35);           // mild height falloff (penumbra softening), full silhouette
+  gl_Position=cl; vPos=aQuad; vA=clamp(aOpa,0.0,1.0);        // uniform darkness (no height falloff) -> looks like a real shadow
 }`;
 const SH_FS=`#version 300 es
 precision highp float; in vec2 vPos; in float vA; out vec4 o; uniform float uDark;
 void main(){ float d=dot(vPos,vPos); if(d>1.0) discard; float rr=sqrt(d);
-  float e=clamp((1.0-rr)*4.0,0.0,1.0);   // solid core, thin hard rim -> crisp silhouette (was soft (1-d)^2 blob)
+  float e=clamp((1.0-rr)*2.6,0.0,1.0);   // solid core + slightly soft edge (sharp silhouette, lightly blurred rim)
   float B=e*uDark*clamp(vA,0.0,1.0); o=vec4(0.0,0.0,0.0,B); }`;
 const shProg=gl.createProgram();gl.attachShader(shProg,sh(gl.VERTEX_SHADER,SH_VS));gl.attachShader(shProg,sh(gl.FRAGMENT_SHADER,SH_FS));gl.linkProgram(shProg);
 if(!gl.getProgramParameter(shProg,gl.LINK_STATUS))console.error('shadow link',gl.getProgramInfoLog(shProg));
@@ -509,7 +511,7 @@ function draw(view,proj){
   // (1b) separate finite ground plane REMOVED — the grounded-skybox background (pass 1) now renders the
   // infinite floor, so there's no plane edge / duplicate world when zoomed out. The shadow draws over it.
   // ---- 2) contact shadow: active frame's splats flattened to y=0, dark + soft + low alpha ----
-  if(SHOW_ENV){
+  if(SHOW_ENV&&shadowOn){
     gl.blendFuncSeparate(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA,gl.ONE,gl.ONE_MINUS_SRC_ALPHA);
     gl.useProgram(shProg);
     gl.bindBuffer(gl.ARRAY_BUFFER,vbos[cur]);
@@ -616,7 +618,7 @@ window.__player.setGrade=(g)=>{Object.assign(grade,g);applyGradeToSliders();};
 
 // ================= WebXR immersive-AR (plays the SAME .mint, anchored on a real floor) =================
 let inXR=false, xrSession=null, xrRefSpace=null, xrHitSource=null, glLayer=null, arSupported=false;
-let placed=false, placeMat=null, reticleMat=null, modelScale=1.0, modelYaw=0, _xrLast=0, _xrAcc=0, _lastGesture=0;
+let placed=false, placeMat=null, reticleMat=null, modelScale=1.0, modelYaw=0, _xrLast=0, _xrAcc=0, _lastGesture=0, shadowOn=true;
 // reticle: a thin glowing ring on the detected floor
 const RET_VS=`#version 300 es
 precision highp float; uniform mat4 uMVP; layout(location=0) in vec2 p; out vec2 vp;
@@ -645,9 +647,11 @@ function drawSplatsXR(mv,proj,fx,fy,vpW,vpH){
   gl.uniform1f(uExposure,1.0); setGradeUniforms();
   gl.drawElementsInstanced(gl.TRIANGLES,6,gl.UNSIGNED_SHORT,0,N);
 }
-// AR cast shadow: project the performer's splats onto the floor (model y=0 = the placement plane) along a
-// light direction -> a pose-following silhouette, NOT a blob. Indoor light ~ fairly overhead -> short shadow.
-const AR_SUN=[-0.28,-0.20];   // ground offset per unit height (steep light); tweakable
+// AR cast shadow: project the performer's splats onto the floor along a 45deg light -> a pose-following
+// silhouette stretched on the ground. MAX blend = overlapping discs take the MAX, never accumulate, so the
+// shadow is a clean ~uniform-opacity silhouette (no balloon/puffy buildup), with a slightly soft edge.
+let AR_SUN=[-0.70,-0.70];     // ground offset per unit height; |.|~1.0 = 45deg light -> shadow ~ as long as height
+let SHADOW_OPACITY=0.25;      // 25%
 function drawShadowXR(mv,proj,vpW,vpH){
   gl.useProgram(shProg);
   gl.bindBuffer(gl.ARRAY_BUFFER,vbos[cur]);
@@ -656,11 +660,12 @@ function drawShadowXR(mv,proj,vpW,vpH){
   gl.enableVertexAttribArray(5);gl.vertexAttribPointer(5,1,gl.FLOAT,false,BYTES,13*4);gl.vertexAttribDivisor(5,1);
   gl.bindBuffer(gl.ARRAY_BUFFER,quad);gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);gl.vertexAttribDivisor(0,0);
   gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,idxBuf);
-  gl.blendFuncSeparate(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA,gl.ONE,gl.ONE_MINUS_SRC_ALPHA);
+  gl.blendEquation(gl.MAX);    // <- key: union of discs, NOT additive -> no puffy buildup
   gl.uniformMatrix4fv(sh_uView,false,mv);gl.uniformMatrix4fv(sh_uProj,false,proj);
   gl.uniform2f(sh_uVP,vpW,vpH);gl.uniform3f(sh_uGround,groundOff[0],groundOff[1],groundOff[2]);
-  gl.uniform1f(sh_uY,0.003);gl.uniform1f(sh_uBlur,bodyH*0.012);gl.uniform1f(sh_uDark,0.5);gl.uniform2f(sh_uSun,AR_SUN[0],AR_SUN[1]);
+  gl.uniform1f(sh_uY,0.003);gl.uniform1f(sh_uBlur,bodyH*0.008);gl.uniform1f(sh_uDark,SHADOW_OPACITY);gl.uniform2f(sh_uSun,AR_SUN[0],AR_SUN[1]);
   gl.drawElementsInstanced(gl.TRIANGLES,6,gl.UNSIGNED_SHORT,0,N);
+  gl.blendEquation(gl.FUNC_ADD);   // restore for the splat pass
 }
 function drawReticle(mvp){
   gl.useProgram(retProg); gl.bindBuffer(gl.ARRAY_BUFFER,retQuad);
@@ -709,7 +714,7 @@ function onXRFrame(t,frame){
       if(placed&&placeMat&&window.__loaded){
         const mv=mat4mul(viewMat, buildModel(placeMat,modelScale,modelYaw));
         sortXR(mv);
-        drawShadowXR(mv,proj,vp.width,vp.height);     // pose-following cast shadow on the floor
+        if(shadowOn) drawShadowXR(mv,proj,vp.width,vp.height);   // pose-following cast shadow (toggle button)
         drawSplatsXR(mv,proj,fx,fy,vp.width,vp.height);
       }
     }
@@ -726,6 +731,9 @@ window.addEventListener('touchmove',e=>{ if(!inXR||e.touches.length!==2)return; 
   _pinch={d,a};
 },{passive:false});
 window.addEventListener('touchend',e=>{ if(e.touches.length<2)_pinch=null; });
+// shadow on/off toggle (tappable in the AR dom-overlay; also affects the desktop preview shadow)
+(function(){ const b=document.getElementById('shadowBtn');
+  b.onclick=(e)=>{ e.stopPropagation(); shadowOn=!shadowOn; b.textContent='Shadow: '+(shadowOn?'On':'Off'); }; })();
 // show the AR button only where immersive-ar is actually available (Android Chrome / ARCore)
 if(navigator.xr&&navigator.xr.isSessionSupported){
   navigator.xr.isSessionSupported('immersive-ar').then(ok=>{ arSupported=ok;
