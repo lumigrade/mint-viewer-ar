@@ -340,21 +340,24 @@ async function load(){
   // choose file via ?mint=NAME  (default flipbook_c.mint); NAME under /MINT_DATA/ unless an absolute path/url
   // pick file via ?m=NAME (or ?mint=); default HB_180_Full; ".mint" auto-appended; bare name -> /MINT_DATA/
   const _q=new URLSearchParams(location.search);
-  // default sequence streams from R2 (CORS-enabled). ?m=<name|url> overrides (bare name -> /MINT_DATA/ for local dev).
+  // ?m=<name|url> overrides. Default = STMTP_390.mint served from this site (GitHub Pages, same dir).
+  // To stream from R2 instead, pass ?m=https://<pub>.r2.dev/SEQUENCES/STMTP_390.mint  (CORS must allow this origin).
   const R2_BASE='https://pub-74912f96f8a84c0db42d38800266b931.r2.dev/SEQUENCES/';
-  let _mp=_q.get('m')||_q.get('mint')||(R2_BASE+'STMTP_390.mint');
-  if(!/\.mint$/i.test(_mp)&&!/^(https?:|\/)/.test(_mp)) _mp+='.mint';
-  const _murl=(/^(https?:|\/)/.test(_mp)?_mp:'/MINT_DATA/'+_mp);
+  let _mp=_q.get('m')||_q.get('mint')||'./STMTP_390.mint';
+  if(!/\.mint$/i.test(_mp)&&!/^(https?:|\/|\.)/.test(_mp)) _mp+='.mint';
+  const _murl=(/^(https?:|\/|\.)/.test(_mp)?_mp:'/MINT_DATA/'+_mp);   // http/abs/relative used as-is; bare name -> local dev
   mintName=_mp.replace(/^.*[\/]/,'').replace(/\.mint$/i,'');     // for the grade file name
   document.getElementById('gName').textContent='file: '+mintName+'.grade.json';
   loadGrade(mintName);                                          // auto-apply a saved grade if present
-  setLoad('downloading '+_mp+' (0%)');
+  setLoad('downloading '+mintName+' (0%)');
   const resp=await fetch(_murl+'?_='+Date.now());
+  if(!resp.ok) throw new Error('could not load '+_murl+' (HTTP '+resp.status+'). Is the .mint uploaded there?');
   const total=+(resp.headers.get('Content-Length')||0);
   const reader=resp.body.getReader();const chunks=[];let recv=0;
   for(;;){const{done,value}=await reader.read();if(done)break;chunks.push(value);recv+=value.length;
     if(total)setLoad('downloading '+((recv/total*100)|0)+'%');}
   let file=new Uint8Array(recv);{let o=0;for(const c of chunks){file.set(c,o);o+=c.length;}}
+  if(file[4]!==0x7b) throw new Error('not a .mint file at '+_murl+' (got '+(new TextDecoder().decode(file.subarray(0,12)))+'…). Check the URL.');
   setLoad('decoding (range coder)...');
   const dec=decodeFlipbookC(file);
   NF=dec.NF;N=dec.N;FPS=dec.FPS;STRIDE=dec.STRIDE;
