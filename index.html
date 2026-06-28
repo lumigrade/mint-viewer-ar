@@ -616,7 +616,7 @@ window.__player.setGrade=(g)=>{Object.assign(grade,g);applyGradeToSliders();};
 
 // ================= WebXR immersive-AR (plays the SAME .mint, anchored on a real floor) =================
 let inXR=false, xrSession=null, xrRefSpace=null, xrHitSource=null, glLayer=null, arSupported=false;
-let placed=false, placeMat=null, reticleMat=null, modelScale=1.0, modelYaw=0, _xrLast=0, _xrAcc=0;
+let placed=false, placeMat=null, reticleMat=null, modelScale=1.0, modelYaw=0, _xrLast=0, _xrAcc=0, _lastGesture=0;
 // reticle: a thin glowing ring on the detected floor
 const RET_VS=`#version 300 es
 precision highp float; uniform mat4 uMVP; layout(location=0) in vec2 p; out vec2 vp;
@@ -645,6 +645,23 @@ function drawSplatsXR(mv,proj,fx,fy,vpW,vpH){
   gl.uniform1f(uExposure,1.0); setGradeUniforms();
   gl.drawElementsInstanced(gl.TRIANGLES,6,gl.UNSIGNED_SHORT,0,N);
 }
+// AR cast shadow: project the performer's splats onto the floor (model y=0 = the placement plane) along a
+// light direction -> a pose-following silhouette, NOT a blob. Indoor light ~ fairly overhead -> short shadow.
+const AR_SUN=[-0.28,-0.20];   // ground offset per unit height (steep light); tweakable
+function drawShadowXR(mv,proj,vpW,vpH){
+  gl.useProgram(shProg);
+  gl.bindBuffer(gl.ARRAY_BUFFER,vbos[cur]);
+  gl.enableVertexAttribArray(1);gl.vertexAttribPointer(1,3,gl.FLOAT,false,BYTES,0);gl.vertexAttribDivisor(1,1);
+  gl.enableVertexAttribArray(2);gl.vertexAttribPointer(2,3,gl.FLOAT,false,BYTES,3*4);gl.vertexAttribDivisor(2,1);
+  gl.enableVertexAttribArray(5);gl.vertexAttribPointer(5,1,gl.FLOAT,false,BYTES,13*4);gl.vertexAttribDivisor(5,1);
+  gl.bindBuffer(gl.ARRAY_BUFFER,quad);gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);gl.vertexAttribDivisor(0,0);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,idxBuf);
+  gl.blendFuncSeparate(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA,gl.ONE,gl.ONE_MINUS_SRC_ALPHA);
+  gl.uniformMatrix4fv(sh_uView,false,mv);gl.uniformMatrix4fv(sh_uProj,false,proj);
+  gl.uniform2f(sh_uVP,vpW,vpH);gl.uniform3f(sh_uGround,groundOff[0],groundOff[1],groundOff[2]);
+  gl.uniform1f(sh_uY,0.003);gl.uniform1f(sh_uBlur,bodyH*0.012);gl.uniform1f(sh_uDark,0.5);gl.uniform2f(sh_uSun,AR_SUN[0],AR_SUN[1]);
+  gl.drawElementsInstanced(gl.TRIANGLES,6,gl.UNSIGNED_SHORT,0,N);
+}
 function drawReticle(mvp){
   gl.useProgram(retProg); gl.bindBuffer(gl.ARRAY_BUFFER,retQuad);
   gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);gl.vertexAttribDivisor(0,0);
@@ -665,8 +682,10 @@ async function enterAR(){
   xrRefSpace=await xrSession.requestReferenceSpace('local-floor').catch(()=>xrSession.requestReferenceSpace('local'));
   const vsp=await xrSession.requestReferenceSpace('viewer');
   xrHitSource=await xrSession.requestHitTestSource({space:vsp});
-  xrSession.addEventListener('select',()=>{ if(reticleMat){ placeMat=reticleMat.slice(); placed=true;
-      hint.textContent='Pinch = scale · two-finger twist = turn · tap = move'; } });
+  xrSession.addEventListener('select',()=>{
+      if(performance.now()-_lastGesture<300) return;        // ignore the tap that ends a pinch/twist gesture
+      if(reticleMat){ placeMat=reticleMat.slice(); placed=true;   // (re)place / REPOSITION at the current reticle
+        hint.textContent='Pinch = scale · two-finger twist = turn · tap elsewhere = move'; } });
   xrSession.addEventListener('end',()=>{ inXR=false; xrSession=null; xrHitSource=null; placed=false;
       hint.style.display='none'; if(arSupported)document.getElementById('enterAR').style.display='block';
       last=performance.now(); requestAnimationFrame(loop); });
@@ -676,7 +695,7 @@ function onXRFrame(t,frame){
   const session=frame.session, pose=frame.getViewerPose(xrRefSpace);
   if(playing&&window.__loaded){ if(!_xrLast)_xrLast=t; _xrAcc+=(t-_xrLast); _xrLast=t;
     const step=1000/FPS; while(_xrAcc>=step){ cur=(cur+1)%NF; _xrAcc-=step; } window.__frame=cur; }
-  if(!placed&&xrHitSource){ const hits=frame.getHitTestResults(xrHitSource);
+  if(xrHitSource){ const hits=frame.getHitTestResults(xrHitSource);   // ALWAYS hit-test so re-tap can reposition
     if(hits.length){ const hp=hits[0].getPose(xrRefSpace); if(hp) reticleMat=hp.transform.matrix; } }
   if(pose){
     gl.bindFramebuffer(gl.FRAMEBUFFER,glLayer.framebuffer);
@@ -685,11 +704,13 @@ function onXRFrame(t,frame){
       const vp=glLayer.getViewport(view); gl.viewport(vp.x,vp.y,vp.width,vp.height);
       const proj=view.projectionMatrix, viewMat=view.transform.inverse.matrix;
       const fx=proj[0]*vp.width/2, fy=proj[5]*vp.height/2;
+      // target ring on the floor where the next tap will move him (also the initial placement reticle)
+      if(reticleMat) drawReticle(mat4mul(proj, mat4mul(viewMat, reticleMat)));
       if(placed&&placeMat&&window.__loaded){
         const mv=mat4mul(viewMat, buildModel(placeMat,modelScale,modelYaw));
-        sortXR(mv); drawSplatsXR(mv,proj,fx,fy,vp.width,vp.height);
-      } else if(reticleMat){
-        drawReticle(mat4mul(proj, mat4mul(viewMat, reticleMat)));
+        sortXR(mv);
+        drawShadowXR(mv,proj,vp.width,vp.height);     // pose-following cast shadow on the floor
+        drawSplatsXR(mv,proj,fx,fy,vp.width,vp.height);
       }
     }
   }
@@ -698,6 +719,7 @@ function onXRFrame(t,frame){
 // two-finger pinch = scale, twist = yaw (single-finger tap passes through to WebXR `select`)
 let _pinch=null;
 window.addEventListener('touchmove',e=>{ if(!inXR||e.touches.length!==2)return; e.preventDefault();
+  _lastGesture=performance.now();   // so the tap that ends the gesture doesn't reposition
   const dx=e.touches[0].clientX-e.touches[1].clientX, dy=e.touches[0].clientY-e.touches[1].clientY;
   const d=Math.hypot(dx,dy), a=Math.atan2(dy,dx);
   if(_pinch){ modelScale=Math.max(0.15,Math.min(10,modelScale*(d/_pinch.d))); modelYaw+=(a-_pinch.a); }
