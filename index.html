@@ -510,22 +510,8 @@ function draw(view,proj){
   }
   // (1b) separate finite ground plane REMOVED — the grounded-skybox background (pass 1) now renders the
   // infinite floor, so there's no plane edge / duplicate world when zoomed out. The shadow draws over it.
-  // ---- 2) contact shadow: active frame's splats flattened to y=0, dark + soft + low alpha ----
-  if(SHOW_ENV&&shadowOn){
-    gl.blendFuncSeparate(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA,gl.ONE,gl.ONE_MINUS_SRC_ALPHA);
-    gl.useProgram(shProg);
-    gl.bindBuffer(gl.ARRAY_BUFFER,vbos[cur]);
-    gl.enableVertexAttribArray(1);gl.vertexAttribPointer(1,3,gl.FLOAT,false,BYTES,0);gl.vertexAttribDivisor(1,1);
-    gl.enableVertexAttribArray(2);gl.vertexAttribPointer(2,3,gl.FLOAT,false,BYTES,3*4);gl.vertexAttribDivisor(2,1);
-    gl.enableVertexAttribArray(5);gl.vertexAttribPointer(5,1,gl.FLOAT,false,BYTES,13*4);gl.vertexAttribDivisor(5,1);
-    gl.bindBuffer(gl.ARRAY_BUFFER,quad);gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);gl.vertexAttribDivisor(0,0);
-    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,idxBuf);
-    gl.uniformMatrix4fv(sh_uView,false,view);gl.uniformMatrix4fv(sh_uProj,false,proj);
-    gl.uniform2f(sh_uVP,W,H);gl.uniform3f(sh_uGround,groundOff[0],groundOff[1],groundOff[2]);
-    gl.uniform1f(sh_uY,0.005);gl.uniform1f(sh_uBlur,bodyH*0.006);gl.uniform1f(sh_uDark,0.6);gl.uniform2f(sh_uSun,SUN_OFF[0],SUN_OFF[1]);
-    gl.drawElementsInstanced(gl.TRIANGLES,6,gl.UNSIGNED_SHORT,0,N);
-    gl.blendFuncSeparate(gl.ONE,gl.ONE_MINUS_SRC_ALPHA,gl.ONE,gl.ONE_MINUS_SRC_ALPHA);
-  }
+  // ---- 2) smooth cast shadow (offscreen silhouette mask -> blur -> composite on the floor) ----
+  if(SHOW_ENV&&shadowOn){ renderShadowFBO(view,proj,null,0,0,W,H); }
   // ---- 3) the splats (grounded + ACES tonemapped) ----
   gl.useProgram(prog);
   bindFrameVBO(vbos[cur]);
@@ -677,6 +663,70 @@ function drawShadowXR(mv,proj,vpW,vpH){
   gl.drawElementsInstanced(gl.TRIANGLES,6,gl.UNSIGNED_SHORT,0,N);
   gl.blendEquation(gl.FUNC_ADD);   // restore for the splat pass
 }
+// ===== SMOOTH CAST SHADOW = offscreen silhouette mask -> blur -> composite on the floor (a real soft shadow,
+// not bubbly discs). Splats are projected to y=0 along the 45deg light into a fixed-size mask texture (uniform
+// discs => solid silhouette regardless of splat size), the mask is gaussian-blurred, then a floor quad samples
+// it and darkens the ground by SHADOW_OPACITY. =====
+const SH_RES=320, SH_REGION=2.6;     // mask resolution; floor half-extent (m) in model space (fits the 45deg cast)
+function _mktex(){ const t=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,t);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA8,SH_RES,SH_RES,0,gl.RGBA,gl.UNSIGNED_BYTE,null);
+  for(const p of [gl.TEXTURE_MIN_FILTER,gl.TEXTURE_MAG_FILTER]) gl.texParameteri(gl.TEXTURE_2D,p,gl.LINEAR);
+  for(const p of [gl.TEXTURE_WRAP_S,gl.TEXTURE_WRAP_T]) gl.texParameteri(gl.TEXTURE_2D,p,gl.CLAMP_TO_EDGE); return t; }
+const shTexA=_mktex(), shTexB=_mktex();
+const shFBOa=gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER,shFBOa); gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,shTexA,0);
+const shFBOb=gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER,shFBOb); gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,shTexB,0);
+gl.bindFramebuffer(gl.FRAMEBUFFER,null);
+const MASK_VS=`#version 300 es
+precision highp float; uniform vec3 uGroundOff; uniform vec2 uSun; uniform float uR,uDiscR;
+layout(location=0) in vec2 aQuad; layout(location=1) in vec3 aCenter; layout(location=5) in float aOpa;
+out vec2 vp; out float vA;
+void main(){ vec3 wp=aCenter+uGroundOff; float h=max(0.0,wp.y); vec2 sxz=wp.xz+h*uSun;
+  vp=aQuad; vA=clamp(aOpa,0.0,1.0); gl_Position=vec4(sxz/uR + aQuad*(uDiscR/uR), 0.0, 1.0); }`;
+const MASK_FS=`#version 300 es
+precision highp float; in vec2 vp; in float vA; out vec4 o;
+void main(){ float d=dot(vp,vp); if(d>1.0)discard; o=vec4((1.0-smoothstep(0.55,1.0,sqrt(d)))*vA); }`;
+const BLUR_FS=`#version 300 es
+precision highp float; in vec2 vNDC; out vec4 o; uniform sampler2D uTex; uniform float uPx;
+void main(){ vec2 uv=vNDC*0.5+0.5; float s=0.0,w=0.0;
+  for(int i=-4;i<=4;i++){ for(int j=-4;j<=4;j++){ float wt=exp(-float(i*i+j*j)/10.0);
+    s+=texture(uTex,uv+vec2(float(i),float(j))*uPx).r*wt; w+=wt; } } o=vec4(s/w); }`;
+const COMP_VS=`#version 300 es
+precision highp float; uniform mat4 uMV,uProj; uniform float uR; layout(location=0) in vec2 aP; out vec2 vUV;
+void main(){ vUV=aP*0.5+0.5; gl_Position=uProj*uMV*vec4(aP.x*uR,0.002,aP.y*uR,1.0); }`;
+const COMP_FS=`#version 300 es
+precision highp float; in vec2 vUV; out vec4 o; uniform sampler2D uMask; uniform float uDark;
+void main(){ float m=texture(uMask,vUV).r; if(m<0.01)discard; o=vec4(0.0,0.0,0.0, clamp(m*1.3,0.0,1.0)*uDark); }`;
+const maskProg=gl.createProgram();gl.attachShader(maskProg,sh(gl.VERTEX_SHADER,MASK_VS));gl.attachShader(maskProg,sh(gl.FRAGMENT_SHADER,MASK_FS));gl.linkProgram(maskProg);
+const blurProg=gl.createProgram();gl.attachShader(blurProg,sh(gl.VERTEX_SHADER,BG_VS));gl.attachShader(blurProg,sh(gl.FRAGMENT_SHADER,BLUR_FS));gl.linkProgram(blurProg);
+const compProg=gl.createProgram();gl.attachShader(compProg,sh(gl.VERTEX_SHADER,COMP_VS));gl.attachShader(compProg,sh(gl.FRAGMENT_SHADER,COMP_FS));gl.linkProgram(compProg);
+const m_uGround=gl.getUniformLocation(maskProg,'uGroundOff'),m_uSun=gl.getUniformLocation(maskProg,'uSun'),m_uR=gl.getUniformLocation(maskProg,'uR'),m_uDiscR=gl.getUniformLocation(maskProg,'uDiscR');
+const bl_uTex=gl.getUniformLocation(blurProg,'uTex'),bl_uPx=gl.getUniformLocation(blurProg,'uPx');
+const c_uMV=gl.getUniformLocation(compProg,'uMV'),c_uProj=gl.getUniformLocation(compProg,'uProj'),c_uR=gl.getUniformLocation(compProg,'uR'),c_uMask=gl.getUniformLocation(compProg,'uMask'),c_uDark=gl.getUniformLocation(compProg,'uDark');
+const compQuad=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,compQuad);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,1,1,-1,1]),gl.STATIC_DRAW);
+function renderShadowFBO(uMV,proj,targetFB,vx,vy,vw,vh){
+  // A) silhouette mask (project splats to floor, uniform discs, MAX coverage)
+  gl.bindFramebuffer(gl.FRAMEBUFFER,shFBOa); gl.viewport(0,0,SH_RES,SH_RES); gl.clearColor(0,0,0,0); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.useProgram(maskProg); gl.bindBuffer(gl.ARRAY_BUFFER,vbos[cur]);
+  gl.enableVertexAttribArray(1);gl.vertexAttribPointer(1,3,gl.FLOAT,false,BYTES,0);gl.vertexAttribDivisor(1,1);
+  gl.enableVertexAttribArray(5);gl.vertexAttribPointer(5,1,gl.FLOAT,false,BYTES,13*4);gl.vertexAttribDivisor(5,1);
+  gl.bindBuffer(gl.ARRAY_BUFFER,quad);gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);gl.vertexAttribDivisor(0,0);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,idxBuf);
+  gl.uniform3f(m_uGround,groundOff[0],groundOff[1],groundOff[2]);gl.uniform2f(m_uSun,AR_SUN[0],AR_SUN[1]);gl.uniform1f(m_uR,SH_REGION);gl.uniform1f(m_uDiscR,0.05);
+  gl.blendEquation(gl.MAX); gl.drawElementsInstanced(gl.TRIANGLES,6,gl.UNSIGNED_SHORT,0,N); gl.blendEquation(gl.FUNC_ADD);
+  // B) gaussian blur A->B
+  gl.bindFramebuffer(gl.FRAMEBUFFER,shFBOb); gl.viewport(0,0,SH_RES,SH_RES); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.disable(gl.BLEND); gl.useProgram(blurProg);
+  gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,shTexA);gl.uniform1i(bl_uTex,0);gl.uniform1f(bl_uPx,1.0/SH_RES);
+  gl.bindBuffer(gl.ARRAY_BUFFER,bgQuad);gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);gl.vertexAttribDivisor(0,0);
+  gl.drawArrays(gl.TRIANGLES,0,3); gl.enable(gl.BLEND);
+  // C) composite the blurred mask onto the floor of the target framebuffer
+  gl.bindFramebuffer(gl.FRAMEBUFFER,targetFB); gl.viewport(vx,vy,vw,vh);
+  gl.useProgram(compProg); gl.blendFuncSeparate(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA,gl.ONE,gl.ONE_MINUS_SRC_ALPHA);
+  gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,shTexB);gl.uniform1i(c_uMask,0);
+  gl.uniformMatrix4fv(c_uMV,false,uMV);gl.uniformMatrix4fv(c_uProj,false,proj);gl.uniform1f(c_uR,SH_REGION);gl.uniform1f(c_uDark,SHADOW_OPACITY);
+  gl.bindBuffer(gl.ARRAY_BUFFER,compQuad);gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);gl.vertexAttribDivisor(0,0);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,idxBuf); gl.drawElements(gl.TRIANGLES,6,gl.UNSIGNED_SHORT,0);
+}
 function drawDonut(mvp,fade){
   gl.useProgram(retProg); gl.bindBuffer(gl.ARRAY_BUFFER,retQuad);
   gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);gl.vertexAttribDivisor(0,0);
@@ -726,7 +776,7 @@ function onXRFrame(t,frame){
         const md=buildModel(placeMat,modelScale,modelYaw);     // performer model (pos+scale+facing)
         const mv=mat4mul(viewMat,md);
         sortXR(mv);
-        if(shadowOn) drawShadowXR(mv,proj,vp.width,vp.height);  // pose-following cast shadow (toggle button)
+        if(shadowOn) renderShadowFBO(mv,proj,glLayer.framebuffer,vp.x,vp.y,vp.width,vp.height);  // smooth cast shadow
         const fade=arFade(); if(fade>0.01) drawDonut(mat4mul(proj,mat4mul(viewMat,md)),fade);  // base ring, fades after 3s
         drawSplatsXR(mv,proj,fx,fy,vp.width,vp.height);
       } else if(reticleMat){
