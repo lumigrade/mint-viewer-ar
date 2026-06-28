@@ -12,7 +12,7 @@
 #grade button{cursor:pointer;color:#fff;background:#345;border:0;padding:4px 8px;border-radius:4px;margin-top:6px}
 #grade .ghint{color:#789;margin-top:4px}
 #recBtn{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);width:66px;height:66px;border-radius:50%;
-  border:4px solid #fff;background:transparent;cursor:pointer;z-index:11;display:flex;align-items:center;justify-content:center;pointer-events:auto}
+  border:4px solid #fff;background:transparent;cursor:pointer;z-index:11;display:none;align-items:center;justify-content:center;pointer-events:auto}
 #recDot{width:46px;height:46px;border-radius:50%;background:#ff3b30;transition:width .15s,height .15s,border-radius .15s}
 #recBtn.rec{animation:recpulse 1.1s infinite}
 #recBtn.rec #recDot{width:24px;height:24px;border-radius:6px}
@@ -23,7 +23,8 @@
 <body>
 <canvas id="c"></canvas>
 <div id="xrOverlay" style="position:fixed;inset:0;pointer-events:none;z-index:7">
-  <button id="shadowBtn" style="position:absolute;left:14px;top:14px;pointer-events:auto;background:#000b;color:#fff;border:1px solid #fff7;border-radius:22px;padding:10px 18px;font:600 14px system-ui">Shadow: On</button>
+  <button id="shadowBtn" style="display:none;position:absolute;left:14px;top:14px;pointer-events:auto;background:#000b;color:#fff;border:1px solid #fff7;border-radius:22px;padding:10px 18px;font:600 14px system-ui">Shadow: On</button>
+  <button id="backBtn" style="display:none;position:absolute;right:14px;top:14px;pointer-events:auto;background:#000b;color:#fff;border:1px solid #fff7;border-radius:22px;padding:10px 18px;font:600 14px system-ui">‹ Back</button>
 </div>
 <button id="enterAR" style="position:fixed;left:50%;bottom:64px;transform:translateX(-50%);display:none;z-index:10;background:#0cf;color:#012;font:600 17px system-ui;border:0;border-radius:30px;padding:13px 30px;box-shadow:0 4px 18px #0006;cursor:pointer">▶ View in AR</button>
 <div id="arHint" style="position:fixed;left:0;right:0;bottom:14px;text-align:center;color:#fff;font:600 14px system-ui;text-shadow:0 1px 3px #000;display:none;z-index:8;pointer-events:none"></div>
@@ -249,7 +250,7 @@ let vbos=[];        // per-frame WebGLBuffer (GPU; active frame re-sorted in-pla
 let center=[0,0,0];
 let groundOff=[0,0,0], feetY=0, bodyH=1.7;   // model->world offset (feet to y=0), body height for framing
 let cur=0,playing=true;
-let SHOW_ENV=true;  // HDRi scene on by default (demo look)
+let SHOW_ENV=false;  // inline PREVIEW = clean plain background (press H for the HDRi scene); AR sets its own
 let audioEl=null;   // embedded-audio element (master playback clock when present)
 window.__frame=0; window.__loaded=false; window.__playing=true;
 
@@ -355,7 +356,7 @@ async function load(){
   // ?m=<name|url> overrides. Default = STMTP_390.mint served from this site (GitHub Pages, same dir).
   // To stream from R2 instead, pass ?m=https://<pub>.r2.dev/SEQUENCES/STMTP_390.mint  (CORS must allow this origin).
   const R2_BASE='https://pub-74912f96f8a84c0db42d38800266b931.r2.dev/SEQUENCES/';
-  let _mp=_q.get('m')||_q.get('mint')||'./STMTP_390.mint';
+  let _mp=_q.get('m')||_q.get('mint')||'https://pub-74912f96f8a84c0db42d38800266b931.r2.dev/SEQUENCES/STMTP_390_clean.mint';
   if(!/\.mint$/i.test(_mp)&&!/^(https?:|\/|\.)/.test(_mp)) _mp+='.mint';
   const _murl=(/^(https?:|\/|\.)/.test(_mp)?_mp:'/MINT_DATA/'+_mp);   // http/abs/relative used as-is; bare name -> local dev
   mintName=_mp.replace(/^.*[\/]/,'').replace(/\.mint$/i,'');     // for the grade file name
@@ -367,16 +368,21 @@ async function load(){
   const total=+(resp.headers.get('Content-Length')||0);
   const reader=resp.body.getReader();const chunks=[];let recv=0;
   for(;;){const{done,value}=await reader.read();if(done)break;chunks.push(value);recv+=value.length;
+    // EARLY format check on the first bytes -> abort before downloading a big incompatible file (e.g. Fashion=276MB).
+    // Our flipbook .mint = [u32 json_len]["{"...]; the Gracia streaming .mint = a little-endian manifest (06 00 00 00…).
+    if(recv>=5 && chunks.length===1 && chunks[0][4]!==0x7b){ reader.cancel();
+      const g=chunks[0][0]>0&&chunks[0][0]<64&&chunks[0][1]===0&&chunks[0][2]===0&&chunks[0][3]===0;
+      throw new Error(g ? 'This clip is in the Gracia streaming format, which this viewer can’t play yet — it needs a LumiGrade flipbook .mint.'
+                        : 'Not a .mint file. Check the URL.'); }
     if(total)setLoad('downloading '+((recv/total*100)|0)+'%');}
   let file=new Uint8Array(recv);{let o=0;for(const c of chunks){file.set(c,o);o+=c.length;}}
-  if(file[4]!==0x7b) throw new Error('not a .mint file at '+_murl+' (got '+(new TextDecoder().decode(file.subarray(0,12)))+'…). Check the URL.');
   setLoad('decoding (range coder)...');
   const dec=decodeFlipbookC(file);
   NF=dec.NF;N=dec.N;FPS=dec.FPS;STRIDE=dec.STRIDE;
   for(let f=0;f<NF;f++)cpu.push(dec.cpu[f]);
   if(dec.audio){ const blob=new Blob([dec.audio.bytes],{type:dec.audio.type});
     audioEl=new Audio(URL.createObjectURL(blob)); audioEl.preload='auto'; audioEl.loop=true; window.__hasAudio=true; window.__audio=audioEl;
-    playing=false; const pb=document.getElementById('play'); if(pb)pb.innerHTML='&#9654;'; }  // start paused -> 1st gesture starts A+V in sync (autoplay-audio is blocked anyway)
+    audioEl.muted=true; }  // preview plays muted (autoplay-audio is blocked); audio unmutes on first gesture / in AR
   // center = mean of frame-0 positions; also feet = global min-Y across ALL frames (ignore transparent
   // padding splats: opa<=0). Used to drop the model so FEET sit on the street at world y=0.
   {let sx=0,sy=0,sz=0,cnt=0;const a=cpu[0];
@@ -547,6 +553,7 @@ function loop(t){
       document.getElementById('seek').value=cur;
       document.getElementById('lbl').textContent=cur+'/'+NF;
     }
+    if(!drag) yaw-=dt*0.00016;   // slow turntable so the inline preview is a clean, lively turntable
     window.__frame=cur;window.__playing=playing;
   }
   const cv=gl.canvas,dpr=Math.min(2,devicePixelRatio||1);const W=cv.clientWidth*dpr,H=cv.clientHeight*dpr;
@@ -754,6 +761,8 @@ async function enterAR(){
   catch(e){ alert('Could not start AR: '+e.message); return; }
   inXR=true; SHOW_ENV=false; playing=true; placed=false; modelScale=1; modelYaw=0; _xrLast=0; _xrAcc=0; _lastInteract=performance.now();
   document.getElementById('enterAR').style.display='none';
+  for(const id of ['recBtn','shadowBtn','backBtn']) document.getElementById(id).style.display=id==='recBtn'?'flex':'block';  // overlay controls are AR-only
+  startAudioOnce();                                         // unmute + start the embedded audio in AR
   const hint=document.getElementById('arHint'); hint.style.display='block'; hint.textContent='Point at the floor, then tap to place';
   glLayer=new XRWebGLLayer(xrSession,gl); xrSession.updateRenderState({baseLayer:glLayer});
   xrRefSpace=await xrSession.requestReferenceSpace('local-floor').catch(()=>xrSession.requestReferenceSpace('local'));
@@ -765,8 +774,10 @@ async function enterAR(){
       if(reticleMat){ placeMat=reticleMat.slice(); placed=true;   // (re)place / REPOSITION at the current reticle
         hint.textContent='Pinch = scale · two-finger twist = turn · tap elsewhere = move'; } });
   xrSession.addEventListener('end',()=>{ inXR=false; xrSession=null; xrHitSource=null; placed=false;
+      stopRec(); for(const id of ['recBtn','shadowBtn','backBtn']) document.getElementById(id).style.display='none';   // AR-only controls
       hint.style.display='none'; if(arSupported)document.getElementById('enterAR').style.display='block';
       last=performance.now(); requestAnimationFrame(loop); });
+  document.getElementById('backBtn').onclick=()=>{ location.href='index.html'; };  // AR Back -> selection
   xrSession.requestAnimationFrame(onXRFrame);
 }
 function onXRFrame(t,frame){
@@ -794,6 +805,18 @@ function onXRFrame(t,frame){
       }
     }
   }
+  // While RECORDING, mirror the performer onto the canvas so the record button captures it (the browser cannot
+  // capture the AR camera passthrough -> the recording shows the performer on a dark backdrop, plus your mic).
+  if(mediaRec&&mediaRec.state==='recording'&&placed&&placeMat&&window.__loaded&&pose){
+    const cw=gl.canvas.width,ch=gl.canvas.height;
+    gl.bindFramebuffer(gl.FRAMEBUFFER,null); gl.viewport(0,0,cw,ch);
+    gl.clearColor(0.05,0.06,0.08,1); gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+    const viewMat=pose.views[0].transform.inverse.matrix, proj=persp(FOV,cw/ch,0.02,1000);
+    const fx=proj[0]*cw/2, fy=proj[5]*ch/2, md=buildModel(placeMat,modelScale,modelYaw), mv=mat4mul(viewMat,md);
+    sortXR(mv);
+    if(shadowOn) renderShadowFBO(mv,proj,null,0,0,cw,ch);
+    drawSplatsXR(mv,proj,fx,fy,cw,ch);
+  }
   session.requestAnimationFrame(onXRFrame);
 }
 // two-finger pinch = scale, twist = yaw (single-finger tap passes through to WebXR `select`)
@@ -820,6 +843,10 @@ if(navigator.xr&&navigator.xr.isSessionSupported){
 // browser cannot capture the live camera passthrough (the OS compositor owns it) -> it records the rendered
 // performer only; for the full AR view (camera + performer + your voice) use the phone's built-in SCREEN
 // RECORDER. The inline/desktop view records the full scene + mic. =====
+let _audioStarted=false;
+function startAudioOnce(){ if(_audioStarted||!audioEl)return; _audioStarted=true; audioEl.muted=false;
+  try{audioEl.currentTime=cur/FPS;}catch(e){} audioEl.play().catch(()=>{}); }
+window.addEventListener('pointerdown',startAudioOnce);   // first tap unmutes + syncs the embedded audio
 let mediaRec=null, recChunks=[], micStream=null, recT0=0, recTimer=null;
 const _fmtT=s=>{const m=Math.floor(s/60);return m+':'+String(Math.floor(s%60)).padStart(2,'0');};
 async function toggleRec(){
