@@ -618,16 +618,26 @@ window.__player.setGrade=(g)=>{Object.assign(grade,g);applyGradeToSliders();};
 
 // ================= WebXR immersive-AR (plays the SAME .mint, anchored on a real floor) =================
 let inXR=false, xrSession=null, xrRefSpace=null, xrHitSource=null, glLayer=null, arSupported=false;
-let placed=false, placeMat=null, reticleMat=null, modelScale=1.0, modelYaw=0, _xrLast=0, _xrAcc=0, _lastGesture=0, shadowOn=true;
+let placed=false, placeMat=null, reticleMat=null, modelScale=1.0, modelYaw=0, _xrLast=0, _xrAcc=0, _lastGesture=0, shadowOn=true, _lastInteract=0;
 // reticle: a thin glowing ring on the detected floor
+// DONUT base-marker: a blue ring under the performer's feet on the floor, with a forward-facing arrow so you
+// can see which way he faces; fades out after a few seconds of no touch ("glued to the ground").
+const DONUT_R=0.45;   // ring radius in metres (×modelScale) — sits around the feet
 const RET_VS=`#version 300 es
-precision highp float; uniform mat4 uMVP; layout(location=0) in vec2 p; out vec2 vp;
-void main(){ vp=p; gl_Position=uMVP*vec4(p.x*0.13,0.002,p.y*0.13,1.0); }`;
+precision highp float; uniform mat4 uMVP; uniform float uR; layout(location=0) in vec2 p; out vec2 vp;
+void main(){ vp=p; gl_Position=uMVP*vec4(p.x*uR,0.003,p.y*uR,1.0); }`;
 const RET_FS=`#version 300 es
-precision highp float; in vec2 vp; out vec4 o;
-void main(){ float r=length(vp); float ring=smoothstep(1.0,0.9,r)*(1.0-smoothstep(0.6,0.72,r)); if(ring<0.02)discard; o=vec4(0.1,0.92,1.0,ring*0.85); }`;
+precision highp float; in vec2 vp; out vec4 o; uniform float uFade;
+void main(){
+  float r=length(vp);
+  float ring=smoothstep(0.80,0.72,r)*smoothstep(0.56,0.64,r);          // the donut band
+  float arrow=(vp.y>0.80)? step(abs(vp.x),(1.0-vp.y)) : 0.0;           // forward triangle (tip at +Y = facing)
+  float a=max(ring,arrow);
+  if(a<0.015) discard;
+  o=vec4(0.13,0.82,1.0, a*0.9*clamp(uFade,0.0,1.0));
+}`;
 const retProg=gl.createProgram();gl.attachShader(retProg,sh(gl.VERTEX_SHADER,RET_VS));gl.attachShader(retProg,sh(gl.FRAGMENT_SHADER,RET_FS));gl.linkProgram(retProg);
-const ret_uMVP=gl.getUniformLocation(retProg,'uMVP');
+const ret_uMVP=gl.getUniformLocation(retProg,'uMVP'),ret_uR=gl.getUniformLocation(retProg,'uR'),ret_uFade=gl.getUniformLocation(retProg,'uFade');
 const retQuad=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,retQuad);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,1,1,-1,1]),gl.STATIC_DRAW);
 
 function buildModel(P,s,yaw){ // P=floor pose (col-major) ; model = P * (Ry(yaw)*scale)
@@ -663,24 +673,26 @@ function drawShadowXR(mv,proj,vpW,vpH){
   gl.blendEquation(gl.MAX);    // <- key: union of discs, NOT additive -> no puffy buildup
   gl.uniformMatrix4fv(sh_uView,false,mv);gl.uniformMatrix4fv(sh_uProj,false,proj);
   gl.uniform2f(sh_uVP,vpW,vpH);gl.uniform3f(sh_uGround,groundOff[0],groundOff[1],groundOff[2]);
-  gl.uniform1f(sh_uY,0.003);gl.uniform1f(sh_uBlur,bodyH*0.008);gl.uniform1f(sh_uDark,SHADOW_OPACITY);gl.uniform2f(sh_uSun,AR_SUN[0],AR_SUN[1]);
+  gl.uniform1f(sh_uY,0.003);gl.uniform1f(sh_uBlur,bodyH*0.004);gl.uniform1f(sh_uDark,SHADOW_OPACITY);gl.uniform2f(sh_uSun,AR_SUN[0],AR_SUN[1]);
   gl.drawElementsInstanced(gl.TRIANGLES,6,gl.UNSIGNED_SHORT,0,N);
   gl.blendEquation(gl.FUNC_ADD);   // restore for the splat pass
 }
-function drawReticle(mvp){
+function drawDonut(mvp,fade){
   gl.useProgram(retProg); gl.bindBuffer(gl.ARRAY_BUFFER,retQuad);
   gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);gl.vertexAttribDivisor(0,0);
   gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,idxBuf);
-  gl.blendFuncSeparate(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA,gl.ONE,gl.ONE_MINUS_SRC_ALPHA);
-  gl.uniformMatrix4fv(ret_uMVP,false,mvp); gl.drawElements(gl.TRIANGLES,6,gl.UNSIGNED_SHORT,0);
+  gl.blendEquation(gl.FUNC_ADD); gl.blendFuncSeparate(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA,gl.ONE,gl.ONE_MINUS_SRC_ALPHA);
+  gl.uniformMatrix4fv(ret_uMVP,false,mvp); gl.uniform1f(ret_uR,DONUT_R); gl.uniform1f(ret_uFade,fade);
+  gl.drawElements(gl.TRIANGLES,6,gl.UNSIGNED_SHORT,0);
 }
+function arFade(){ const dt=performance.now()-_lastInteract; return Math.max(0,Math.min(1, 1-(dt-3000)/600)); } // full 3s, fade ~0.6s
 async function enterAR(){
   if(inXR||!navigator.xr) return;
   try{ xrSession=await navigator.xr.requestSession('immersive-ar',
         {requiredFeatures:['hit-test'], optionalFeatures:['local-floor','dom-overlay','light-estimation'],
          domOverlay:{root:document.getElementById('xrOverlay')}}); }
   catch(e){ alert('Could not start AR: '+e.message); return; }
-  inXR=true; SHOW_ENV=false; playing=true; placed=false; modelScale=1; modelYaw=0; _xrLast=0; _xrAcc=0;
+  inXR=true; SHOW_ENV=false; playing=true; placed=false; modelScale=1; modelYaw=0; _xrLast=0; _xrAcc=0; _lastInteract=performance.now();
   document.getElementById('enterAR').style.display='none';
   const hint=document.getElementById('arHint'); hint.style.display='block'; hint.textContent='Point at the floor, then tap to place';
   glLayer=new XRWebGLLayer(xrSession,gl); xrSession.updateRenderState({baseLayer:glLayer});
@@ -688,6 +700,7 @@ async function enterAR(){
   const vsp=await xrSession.requestReferenceSpace('viewer');
   xrHitSource=await xrSession.requestHitTestSource({space:vsp});
   xrSession.addEventListener('select',()=>{
+      _lastInteract=performance.now();                      // show the donut on interaction
       if(performance.now()-_lastGesture<300) return;        // ignore the tap that ends a pinch/twist gesture
       if(reticleMat){ placeMat=reticleMat.slice(); placed=true;   // (re)place / REPOSITION at the current reticle
         hint.textContent='Pinch = scale · two-finger twist = turn · tap elsewhere = move'; } });
@@ -709,13 +722,15 @@ function onXRFrame(t,frame){
       const vp=glLayer.getViewport(view); gl.viewport(vp.x,vp.y,vp.width,vp.height);
       const proj=view.projectionMatrix, viewMat=view.transform.inverse.matrix;
       const fx=proj[0]*vp.width/2, fy=proj[5]*vp.height/2;
-      // target ring on the floor where the next tap will move him (also the initial placement reticle)
-      if(reticleMat) drawReticle(mat4mul(proj, mat4mul(viewMat, reticleMat)));
       if(placed&&placeMat&&window.__loaded){
-        const mv=mat4mul(viewMat, buildModel(placeMat,modelScale,modelYaw));
+        const md=buildModel(placeMat,modelScale,modelYaw);     // performer model (pos+scale+facing)
+        const mv=mat4mul(viewMat,md);
         sortXR(mv);
-        if(shadowOn) drawShadowXR(mv,proj,vp.width,vp.height);   // pose-following cast shadow (toggle button)
+        if(shadowOn) drawShadowXR(mv,proj,vp.width,vp.height);  // pose-following cast shadow (toggle button)
+        const fade=arFade(); if(fade>0.01) drawDonut(mat4mul(proj,mat4mul(viewMat,md)),fade);  // base ring, fades after 3s
         drawSplatsXR(mv,proj,fx,fy,vp.width,vp.height);
+      } else if(reticleMat){
+        drawDonut(mat4mul(proj, mat4mul(viewMat, reticleMat)), 1.0);   // placement preview at the floor hit point
       }
     }
   }
@@ -723,8 +738,9 @@ function onXRFrame(t,frame){
 }
 // two-finger pinch = scale, twist = yaw (single-finger tap passes through to WebXR `select`)
 let _pinch=null;
+window.addEventListener('touchstart',()=>{ if(inXR) _lastInteract=performance.now(); });  // any touch re-shows the donut
 window.addEventListener('touchmove',e=>{ if(!inXR||e.touches.length!==2)return; e.preventDefault();
-  _lastGesture=performance.now();   // so the tap that ends the gesture doesn't reposition
+  _lastGesture=performance.now(); _lastInteract=performance.now();   // gesture: don't reposition; re-show donut
   const dx=e.touches[0].clientX-e.touches[1].clientX, dy=e.touches[0].clientY-e.touches[1].clientY;
   const d=Math.hypot(dx,dy), a=Math.atan2(dy,dx);
   if(_pinch){ modelScale=Math.max(0.15,Math.min(10,modelScale*(d/_pinch.d))); modelYaw+=(a-_pinch.a); }
