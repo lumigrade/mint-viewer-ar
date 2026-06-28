@@ -1,0 +1,712 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Flipbook splat player (180f exact)</title>
+<style>html,body{margin:0;height:100%;background:#000;overflow:hidden;font-family:monospace}
+#c{width:100vw;height:100vh;display:block}
+#hud{position:fixed;left:12px;bottom:12px;color:#9f9;font-size:12px;background:#0008;padding:6px 10px;border-radius:6px}
+#hud *{vertical-align:middle}#play{cursor:pointer;color:#fff;background:#333;border:0;padding:3px 9px;border-radius:4px}
+#seek{width:320px}
+#load{position:fixed;left:0;top:0;right:0;bottom:0;display:flex;align-items:center;justify-content:center;color:#9f9;font-size:18px;background:#000;z-index:9}
+#grade{position:fixed;right:10px;top:10px;width:228px;background:#000a;color:#cfe;font-size:11px;padding:8px 10px;border-radius:8px;display:none;z-index:8}
+#grade h4{margin:2px 0 6px;color:#9cf;font-size:12px}
+#grade .row{display:flex;align-items:center;justify-content:space-between;margin:3px 0}
+#grade .row label{flex:0 0 78px}#grade .row input{flex:1;margin:0 5px}#grade .row .v{flex:0 0 34px;text-align:right;color:#fff}
+#grade button{cursor:pointer;color:#fff;background:#345;border:0;padding:4px 8px;border-radius:4px;margin-top:6px}
+#grade .ghint{color:#789;margin-top:4px}
+</style></head>
+<body>
+<canvas id="c"></canvas>
+<div id="xrOverlay" style="position:fixed;inset:0;pointer-events:none;z-index:7"></div>
+<button id="enterAR" style="position:fixed;left:50%;bottom:64px;transform:translateX(-50%);display:none;z-index:10;background:#0cf;color:#012;font:600 17px system-ui;border:0;border-radius:30px;padding:13px 30px;box-shadow:0 4px 18px #0006;cursor:pointer">▶ View in AR</button>
+<div id="arHint" style="position:fixed;left:0;right:0;bottom:14px;text-align:center;color:#fff;font:600 14px system-ui;text-shadow:0 1px 3px #000;display:none;z-index:8;pointer-events:none"></div>
+<div id="load">loading 0%</div>
+<div id="grade"><h4>Grade <span style="color:#789;font-weight:normal">(press G)</span></h4><div id="gradeRows"></div>
+ <button id="gSave">Save .grade.json</button> <button id="gReset">Reset</button>
+ <div class="ghint" id="gName"></div></div>
+<div id="hud"><button id="play">&#10074;&#10074;</button>
+ <input id="seek" type="range" min="0" max="179" value="0"> <span id="lbl">0/180</span> <span id="fps2"></span></div>
+<script>
+const gl = document.getElementById('c').getContext('webgl2',{antialias:true,alpha:true,premultipliedAlpha:true,xrCompatible:true});
+gl.getExtension('EXT_color_buffer_float'); gl.getExtension('OES_texture_float_linear'); // float HDRi sampling
+// ----- shaders (reused from vp_player.html) + ground offset + ACES tonemap to match demo.gracia.ai -----
+const VS=`#version 300 es
+precision highp float;
+uniform mat4 uView, uProj; uniform vec2 uFocal, uViewport; uniform vec3 uGroundOff; uniform float uAniso;
+layout(location=0) in vec2 aQuad;          // [-2,2] quad corner
+layout(location=1) in vec3 aCenter;
+layout(location=2) in vec3 aScale;
+layout(location=3) in vec4 aQuat;          // wxyz
+layout(location=4) in vec3 aColor;         // 0..1
+layout(location=5) in float aOpa;
+out vec4 vCol; out vec2 vPos;
+void main(){
+  vec4 cam = uView * vec4(aCenter+uGroundOff,1.0);
+  if(cam.z>-0.01){ gl_Position=vec4(0,0,2,1); return; }
+  float w=aQuat.x,x=aQuat.y,y=aQuat.z,z=aQuat.w;
+  mat3 R = mat3(1.-2.*(y*y+z*z),2.*(x*y+w*z),2.*(x*z-w*y),
+               2.*(x*y-w*z),1.-2.*(x*x+z*z),2.*(y*z+w*x),
+               2.*(x*z+w*y),2.*(y*z-w*x),1.-2.*(x*x+y*y));
+  // DE-SPIKE: FLOOR every axis to max_axis/uAniso -> fattens razor-thin (edge-on disk / needle) splats so
+  // they can't render as dark spikes around the head/hair, while leaving round splats untouched. uAniso<=0 off.
+  vec3 sc=aScale;
+  if(uAniso>0.0){ float mx=max(max(sc.x,sc.y),sc.z); sc=max(sc, vec3(mx/uAniso)); }
+  mat3 S = mat3(sc.x,0.,0., 0.,sc.y,0., 0.,0.,sc.z);
+  mat3 M = R*S; mat3 Sigma = M*transpose(M);
+  float fx=uFocal.x, fy=uFocal.y, z2=cam.z*cam.z;
+  mat3 J = mat3(fx/cam.z,0.,-fx*cam.x/z2, 0.,fy/cam.z,-fy*cam.y/z2, 0.,0.,0.);
+  mat3 W = mat3(uView);
+  mat3 T = J*W;
+  mat3 cov = T*Sigma*transpose(T);
+  float a=cov[0][0]+0.3, b=cov[0][1], c=cov[1][1]+0.3;
+  float tr=a+c, det=a*c-b*b; float s=sqrt(max(0.,tr*tr/4.-det));
+  float l1=tr/2.+s, l2=max(0.1,tr/2.-s);
+  vec2 e1=normalize(vec2(b, l1-a)); if(abs(b)<1e-6) e1=vec2(1,0);
+  vec2 v1=min(sqrt(2.*l1),256.)*e1, v2=min(sqrt(2.*l2),256.)*vec2(-e1.y,e1.x);
+  vec4 cl=uProj*cam; vec2 ndc=cl.xy/cl.w;
+  vec2 off=(aQuad.x*v1+aQuad.y*v2)/uViewport*2.;
+  gl_Position=vec4(ndc+off,0.,1.); vCol=vec4(aColor,aOpa); vPos=aQuad;
+}`;
+const FS=`#version 300 es
+precision highp float; in vec4 vCol; in vec2 vPos; out vec4 o; uniform float uExposure;
+// color GRADE uniforms (neutral defaults = identity). Applied to the splat (actor) color only.
+uniform float gExp,gBlack,gWhite,gContrast,gTemp,gTint,gHue,gSat; uniform vec3 gGain;
+vec3 hueRot(vec3 c,float deg){ float a=radians(deg),s=sin(a),k=cos(a);
+  mat3 m=mat3(0.299,0.299,0.299, 0.587,0.587,0.587, 0.114,0.114,0.114)
+       + k*mat3(0.701,-0.299,-0.299, -0.587,0.413,-0.587, -0.114,-0.114,0.886)
+       + s*mat3(0.168,-0.328,1.25, 0.330,0.035,-1.05, -0.497,0.292,-0.203);
+  return m*c; }
+vec3 grade(vec3 c){
+  c*=exp2(gExp);                                   // exposure (stops)
+  c=(c-gBlack)/max(1e-3,gWhite-gBlack);            // black/white levels
+  c=(c-0.5)*gContrast+0.5;                         // contrast
+  c+=vec3(gTemp,gTint,-gTemp)*0.5;                 // temperature (R/B) + tint (G)
+  c*=gGain;                                        // per-channel RGB gain
+  float l=dot(c,vec3(0.299,0.587,0.114)); c=mix(vec3(l),c,gSat);  // saturation
+  c=hueRot(c,gHue);                                // hue rotation
+  return clamp(c,0.0,1.0); }
+// The splat rgb (clip(0.2820948*fdc+0.5)) is ALREADY a display-ready (sRGB-ish) color; uExposure (~1.0) sits
+// it in the lit street, then the live grade is applied (identity until adjusted).
+void main(){ float A=-dot(vPos,vPos); if(A<-4.0) discard; float B=exp(A)*vCol.a;
+  vec3 c=grade(vCol.rgb*uExposure); o=vec4(c*B,B); }`;
+function sh(t,s){const o=gl.createShader(t);gl.shaderSource(o,s);gl.compileShader(o);if(!gl.getShaderParameter(o,gl.COMPILE_STATUS))console.error(gl.getShaderInfoLog(o));return o;}
+const prog=gl.createProgram();gl.attachShader(prog,sh(gl.VERTEX_SHADER,VS));gl.attachShader(prog,sh(gl.FRAGMENT_SHADER,FS));gl.linkProgram(prog);
+if(!gl.getProgramParameter(prog,gl.LINK_STATUS))console.error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+gl.enable(gl.BLEND);gl.blendFuncSeparate(gl.ONE,gl.ONE_MINUS_SRC_ALPHA,gl.ONE,gl.ONE_MINUS_SRC_ALPHA);
+
+// quad + index (static)
+const quad=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,quad);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-2,-2,2,-2,2,2,-2,2]),gl.STATIC_DRAW);
+const idxBuf=gl.createBuffer();gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,idxBuf);gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,new Uint16Array([0,1,2,0,2,3]),gl.STATIC_DRAW);
+
+const uView=gl.getUniformLocation(prog,'uView'),uProj=gl.getUniformLocation(prog,'uProj');
+const uFocal=gl.getUniformLocation(prog,'uFocal'),uViewport=gl.getUniformLocation(prog,'uViewport');
+const uGroundOff=gl.getUniformLocation(prog,'uGroundOff'),uExposure=gl.getUniformLocation(prog,'uExposure'),uAniso=gl.getUniformLocation(prog,'uAniso');
+const gU={}; ['gExp','gBlack','gWhite','gContrast','gTemp','gTint','gHue','gSat','gGain'].forEach(k=>gU[k]=gl.getUniformLocation(prog,k));
+// ---- live color grade + de-spike (saved/loaded as MINT_DATA/<name>.grade.json) ----
+const GRADE_DEFS=[ // key,label,min,max,step,default
+  ['exp','Exposure',-2,2,0.01,0],['black','Black level',0,0.4,0.005,0],['white','White level',0.6,1.4,0.005,1],
+  ['contrast','Contrast',0.5,2,0.01,1],['temp','Temperature',-1,1,0.01,0],['tint','Tint',-1,1,0.01,0],
+  ['hue','Hue',-180,180,1,0],['sat','Saturation',0,2,0.01,1],
+  ['gr','R gain',0,2,0.01,1],['gg','G gain',0,2,0.01,1],['gb','B gain',0,2,0.01,1],
+  ['aniso','De-spike',0,16,0.5,5]];  // 5 = floor thin axes to max/5 -> kills edge-on head/hair spikes, minimal softening; 0=off
+let grade={}; GRADE_DEFS.forEach(d=>grade[d[0]]=d[5]);
+function setGradeUniforms(){ gl.useProgram(prog);
+  gl.uniform1f(gU.gExp,grade.exp);gl.uniform1f(gU.gBlack,grade.black);gl.uniform1f(gU.gWhite,grade.white);
+  gl.uniform1f(gU.gContrast,grade.contrast);gl.uniform1f(gU.gTemp,grade.temp);gl.uniform1f(gU.gTint,grade.tint);
+  gl.uniform1f(gU.gHue,grade.hue);gl.uniform1f(gU.gSat,grade.sat);gl.uniform3f(gU.gGain,grade.gr,grade.gg,grade.gb);
+  gl.uniform1f(uAniso,grade.aniso); }
+
+// ============ HDRi STREET DOME background (equirect skybox) — same asset/exposure as demo.gracia.ai ============
+const EXPOSURE=0.7;     // HDRi background ACES exposure (viewer_pc 'Street Dome' preset)
+const GND_EXP=1.05;     // ground floor exposure (a touch brighter -> lit street like the demo, less dark away from sun)
+const MODEL_BRIGHT=1.05;// splat albedo brightness (already display-encoded; ~1.0 = original/correct look)
+const SKY_ROT=0.0;      // preset rotation (radians)
+const BG_VS=`#version 300 es
+precision highp float; layout(location=0) in vec2 aP; out vec2 vNDC;
+void main(){ vNDC=aP; gl_Position=vec4(aP,0.999999,1.0); }`;
+const BG_FS=`#version 300 es
+precision highp float; in vec2 vNDC; out vec4 o;
+uniform mat4 uInvVP; uniform vec3 uCamPos; uniform sampler2D uEnv; uniform float uExposure; uniform float uGExp; uniform float uRot; uniform float uHeight; uniform float uR;
+vec3 aces(vec3 x){ return clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14),0.0,1.0); }
+void main(){
+  vec4 wp=uInvVP*vec4(vNDC,1.0,1.0); vec3 dir=normalize(wp.xyz/wp.w - uCamPos);
+  // UNIFIED GROUNDED SKYBOX = one continuous surface (a sky-sphere of radius uR + a ground cap at y=0),
+  // both sampled by the direction from the SAME fixed center (0,uHeight,0). The horizon is the sphere/ground
+  // tangent, so sky & floor stay LOCKED together (no split / no duplicate band when orbiting or zooming).
+  vec3 center=vec3(0.0,uHeight,0.0), ro=uCamPos-center;
+  float tg = (dir.y < -1e-4) ? (-uCamPos.y/dir.y) : 1e30;      // ray ∩ ground plane y=0
+  float b=dot(ro,dir), c=dot(ro,ro)-uR*uR, disc=b*b-c;
+  float ts = (disc>0.0) ? (-b+sqrt(disc)) : 1e30;             // ray ∩ sky sphere (far hit; camera is inside)
+  bool ground = tg < ts;
+  vec3 hit = uCamPos + dir*min(tg,ts);
+  vec3 sdir = normalize(hit - center);
+  if(ground && sdir.y < -0.30){ sdir.y=-0.30; sdir=normalize(sdir); }  // near-feet floor: lit road, not dark nadir
+  float ex = ground ? uGExp : uExposure;
+  float cr=cos(uRot),sr=sin(uRot); sdir=vec3(cr*sdir.x+sr*sdir.z, sdir.y, -sr*sdir.x+cr*sdir.z);
+  float u=atan(sdir.z,sdir.x)/6.2831853+0.5; float v=acos(clamp(sdir.y,-1.0,1.0))/3.14159265;
+  o=vec4(aces(texture(uEnv,vec2(u,v)).rgb*ex),1.0);
+}`;
+const bgProg=gl.createProgram();gl.attachShader(bgProg,sh(gl.VERTEX_SHADER,BG_VS));gl.attachShader(bgProg,sh(gl.FRAGMENT_SHADER,BG_FS));gl.linkProgram(bgProg);
+if(!gl.getProgramParameter(bgProg,gl.LINK_STATUS))console.error('bg link',gl.getProgramInfoLog(bgProg));
+const bgQuad=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,bgQuad);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1, 3,-1, -1,3]),gl.STATIC_DRAW);
+const u_InvVP=gl.getUniformLocation(bgProg,'uInvVP'),u_CamPos=gl.getUniformLocation(bgProg,'uCamPos'),u_Env=gl.getUniformLocation(bgProg,'uEnv'),u_bgExp=gl.getUniformLocation(bgProg,'uExposure'),u_bgRot=gl.getUniformLocation(bgProg,'uRot'),u_bgGExp=gl.getUniformLocation(bgProg,'uGExp'),u_bgHeight=gl.getUniformLocation(bgProg,'uHeight'),u_bgR=gl.getUniformLocation(bgProg,'uR');
+const SKY_R=80.0;  // grounded-skybox sphere radius (larger = sky more 'infinite'; horizon stays locked to the ground)
+let envTex=null;
+
+// ============ GROUND PLANE at y=0 (ShadowCatcher-equivalent) — finite floor so the performer is PLANTED,
+// not floating over the infinite-dome horizon. Samples the HDRi by the world ray so it parallax-matches the
+// street near the feet and fades into the dome horizon at distance. Receives the contact shadow. ============
+const GND_VS=`#version 300 es
+precision highp float; uniform mat4 uView,uProj; layout(location=0) in vec2 aP;
+out vec3 vWorld;
+void main(){ vec3 w=vec3(aP.x,0.0,aP.y); vWorld=w; gl_Position=uProj*uView*vec4(w,1.0); }`;
+const GND_FS=`#version 300 es
+precision highp float; in vec3 vWorld; out vec4 o;
+uniform vec3 uCamPos; uniform sampler2D uEnv; uniform float uExposure; uniform float uRot; uniform float uFade; uniform float uHeight;
+vec3 aces(vec3 x){ return clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14),0.0,1.0); }
+void main(){
+  // GROUNDED-SKYBOX projection: sample the HDRi as a real receding street floor, from the FIXED capture
+  // point (0,uHeight,0) — NOT the moving camera (which hits the dark nadir & swims). uHeight = HDRi tripod height.
+  vec3 dir=vec3(vWorld.x, -uHeight, vWorld.z);
+  dir=normalize(dir);
+  // clamp how steeply-down we sample so near-feet ground shows the LIT road band, not the dark nadir under the tripod
+  if(dir.y < -0.30){ dir.y=-0.30; dir=normalize(dir); }
+  float cr=cos(uRot),sr=sin(uRot); dir=vec3(cr*dir.x+sr*dir.z, dir.y, -sr*dir.x+cr*dir.z);
+  float u=atan(dir.z,dir.x)/6.2831853+0.5; float v=acos(clamp(dir.y,-1.0,1.0))/3.14159265;
+  vec3 hdr=texture(uEnv,vec2(u,v)).rgb; vec3 c=aces(hdr*uExposure);
+  float d=length(vWorld.xz); float a=clamp(1.0-d/uFade,0.0,1.0);  // fade plane into the dome at distance
+  o=vec4(c,a);
+}`;
+const gndProg=gl.createProgram();gl.attachShader(gndProg,sh(gl.VERTEX_SHADER,GND_VS));gl.attachShader(gndProg,sh(gl.FRAGMENT_SHADER,GND_FS));gl.linkProgram(gndProg);
+if(!gl.getProgramParameter(gndProg,gl.LINK_STATUS))console.error('gnd link',gl.getProgramInfoLog(gndProg));
+const GND_R=60.0;  // ground plane half-extent (world units)
+const gndQuad=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,gndQuad);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-GND_R,-GND_R, GND_R,-GND_R, GND_R,GND_R, -GND_R,GND_R]),gl.STATIC_DRAW);
+const gndIdx=gl.createBuffer();gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,gndIdx);gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,new Uint16Array([0,1,2,0,2,3]),gl.STATIC_DRAW);
+const g_uView=gl.getUniformLocation(gndProg,'uView'),g_uProj=gl.getUniformLocation(gndProg,'uProj'),g_CamPos=gl.getUniformLocation(gndProg,'uCamPos'),g_Env=gl.getUniformLocation(gndProg,'uEnv'),g_Exp=gl.getUniformLocation(gndProg,'uExposure'),g_Rot=gl.getUniformLocation(gndProg,'uRot'),g_Fade=gl.getUniformLocation(gndProg,'uFade'),g_Height=gl.getUniformLocation(gndProg,'uHeight');
+const GND_HEIGHT=1.5;  // HDRi capture/tripod height for the grounded-skybox floor projection
+
+// ============ CONTACT SHADOW — active frame's splats flattened onto y=0, dark + soft + low alpha ============
+// (tracks the pose; tight under the body like the demo ShadowCatcher look, NOT a big dark dish)
+const SH_VS=`#version 300 es
+precision highp float;
+uniform mat4 uView, uProj; uniform vec3 uGroundOff; uniform float uShadowY; uniform float uBlur;
+uniform vec2 uSunOff;     // ground displacement per unit height = -(sun.xz/sun.y) -> shadow cast at the sun's angle
+layout(location=0) in vec2 aQuad;
+layout(location=1) in vec3 aCenter;
+layout(location=2) in vec3 aScale;
+layout(location=5) in float aOpa;
+out vec2 vPos; out float vA;
+void main(){
+  vec3 wp=aCenter+uGroundOff;                                 // grounded splat world pos
+  float h=max(0.0,wp.y);                                      // height above ground
+  vec2 sxz=wp.xz + h*uSunOff;                                 // PROJECT along the sun dir onto y=0 (angled shadow)
+  float r=max(aScale.x,aScale.z)*1.3+uBlur+h*0.015;          // TIGHT footprint (sharp silhouette), tiny penumbra growth
+  vec3 g=vec3(sxz.x+aQuad.x*r, uShadowY, sxz.y+aQuad.y*r);    // world-space soft disc at the projected position
+  vec4 cl=uProj*uView*vec4(g,1.0);
+  gl_Position=cl; vPos=aQuad; vA=aOpa/(1.0+h*0.35);           // mild height falloff (penumbra softening), full silhouette
+}`;
+const SH_FS=`#version 300 es
+precision highp float; in vec2 vPos; in float vA; out vec4 o; uniform float uDark;
+void main(){ float d=dot(vPos,vPos); if(d>1.0) discard; float rr=sqrt(d);
+  float e=clamp((1.0-rr)*4.0,0.0,1.0);   // solid core, thin hard rim -> crisp silhouette (was soft (1-d)^2 blob)
+  float B=e*uDark*clamp(vA,0.0,1.0); o=vec4(0.0,0.0,0.0,B); }`;
+const shProg=gl.createProgram();gl.attachShader(shProg,sh(gl.VERTEX_SHADER,SH_VS));gl.attachShader(shProg,sh(gl.FRAGMENT_SHADER,SH_FS));gl.linkProgram(shProg);
+if(!gl.getProgramParameter(shProg,gl.LINK_STATUS))console.error('shadow link',gl.getProgramInfoLog(shProg));
+const sh_uView=gl.getUniformLocation(shProg,'uView'),sh_uProj=gl.getUniformLocation(shProg,'uProj'),sh_uVP=gl.getUniformLocation(shProg,'uViewport');
+const sh_uGround=gl.getUniformLocation(shProg,'uGroundOff'),sh_uY=gl.getUniformLocation(shProg,'uShadowY'),sh_uBlur=gl.getUniformLocation(shProg,'uBlur'),sh_uDark=gl.getUniformLocation(shProg,'uDark'),sh_uSun=gl.getUniformLocation(shProg,'uSunOff');
+// HDRi sun (wide_street_02_2k): dir(0.76,0.34,0.55), elev 20deg. Shadow ground offset per unit height = -(sun.xz/sun.y).
+// shadow cast at the sun's azimuth; length shortened toward the demo's contained soft shadow (SHLEN scales the
+// physical 20deg-sun offset of ~2.75/height down to ~1.2/height, i.e. an effective ~40deg sun).
+const SUN_DIR=[0.760,0.342,0.553], SHLEN=0.44;
+const SUN_OFF=[-SUN_DIR[0]/SUN_DIR[1]*SHLEN, -SUN_DIR[2]/SUN_DIR[1]*SHLEN];  // ~(-0.98,-0.71)
+
+// Each splat in the interleaved VBO = 14 floats: px,py,pz, sx,sy,sz, qw,qx,qy,qz, r,g,b, a
+const FLOATS=14, BYTES=FLOATS*4;
+function bindFrameVBO(vbo){
+  gl.bindBuffer(gl.ARRAY_BUFFER,vbo);
+  const F=4;
+  gl.enableVertexAttribArray(1);gl.vertexAttribPointer(1,3,gl.FLOAT,false,BYTES,0*F);gl.vertexAttribDivisor(1,1); // center
+  gl.enableVertexAttribArray(2);gl.vertexAttribPointer(2,3,gl.FLOAT,false,BYTES,3*F);gl.vertexAttribDivisor(2,1); // scale
+  gl.enableVertexAttribArray(3);gl.vertexAttribPointer(3,4,gl.FLOAT,false,BYTES,6*F);gl.vertexAttribDivisor(3,1); // quat
+  gl.enableVertexAttribArray(4);gl.vertexAttribPointer(4,3,gl.FLOAT,false,BYTES,10*F);gl.vertexAttribDivisor(4,1);// color
+  gl.enableVertexAttribArray(5);gl.vertexAttribPointer(5,1,gl.FLOAT,false,BYTES,13*F);gl.vertexAttribDivisor(5,1);// opa
+}
+
+// ----- state -----
+let NF=0,N=0,FPS=25,STRIDE=28;
+let cpu=[];         // per-frame Float32Array(N*14) interleaved (CPU source of truth, for re-sort)
+let vbos=[];        // per-frame WebGLBuffer (GPU; active frame re-sorted in-place per tick)
+let center=[0,0,0];
+let groundOff=[0,0,0], feetY=0, bodyH=1.7;   // model->world offset (feet to y=0), body height for framing
+let cur=0,playing=true;
+let SHOW_ENV=true;  // HDRi scene on by default (demo look)
+let audioEl=null;   // embedded-audio element (master playback clock when present)
+window.__frame=0; window.__loaded=false; window.__playing=true;
+
+// ----- Radiance .hdr (RGBE) loader -> linear-RGB float equirect texture -----
+async function loadHDR(url){
+  const buf=new Uint8Array(await (await fetch(url+'?_='+Date.now())).arrayBuffer());
+  let p=0; function line(){let s='';while(p<buf.length){const c=buf[p++];if(c===10)break;s+=String.fromCharCode(c);}return s;}
+  if(!line().startsWith('#?')) throw new Error('not RADIANCE');
+  let l; while((l=line())!=='' ){}                 // skip header until blank line
+  const res=line(); const m=res.match(/-Y\s+(\d+)\s+\+X\s+(\d+)/); if(!m)throw new Error('bad res '+res);
+  const H=+m[1],W=+m[2]; const rgbe=new Uint8Array(W*H*4);
+  for(let y=0;y<H;y++){
+    // new-style RLE scanline?
+    if(buf[p]===2&&buf[p+1]===2&&((buf[p+2]<<8)|buf[p+3])===W){
+      p+=4; const row=y*W*4;
+      for(let ch=0;ch<4;ch++){let x=0;while(x<W){let cnt=buf[p++];
+        if(cnt>128){const v=buf[p++];cnt-=128;while(cnt-->0)rgbe[row+(x++)*4+ch]=v;}
+        else{while(cnt-->0)rgbe[row+(x++)*4+ch]=buf[p++];}}}
+    } else { // flat scanline
+      const row=y*W*4; for(let x=0;x<W;x++){rgbe[row+x*4]=buf[p++];rgbe[row+x*4+1]=buf[p++];rgbe[row+x*4+2]=buf[p++];rgbe[row+x*4+3]=buf[p++];}
+    }
+  }
+  const fl=new Float32Array(W*H*3);
+  for(let i=0;i<W*H;i++){const e=rgbe[i*4+3];const f=e?Math.pow(2,e-136):0;  // 2^(e-128-8)
+    fl[i*3]=rgbe[i*4]*f; fl[i*3+1]=rgbe[i*4+1]*f; fl[i*3+2]=rgbe[i*4+2]*f;}
+  const tex=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,tex);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGB16F,W,H,0,gl.RGB,gl.FLOAT,fl);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.REPEAT);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  return tex;
+}
+
+// f16 decode
+function f16(u){ const s=(u&0x8000)?-1:1,e=(u>>10)&0x1f,m=u&0x3ff;
+  if(e==0)return s*Math.pow(2,-14)*(m/1024); if(e==31)return m?NaN:s*Infinity; return s*Math.pow(2,e-15)*(1+m/1024); }
+// fast f16->f32 via lookup of exponents handled inline; build a table for speed
+const F16T=new Float32Array(65536); for(let i=0;i<65536;i++)F16T[i]=f16(i);
+
+function setLoad(p){const el=document.getElementById('load');if(el)el.textContent=p;}
+
+// ===== range-coded flipbook decoder (mirrors verified Python reference) =====
+const _RC_SCALE=14,_RC_M=1<<14,_RC_L=1<<23,_RC_CH=14;
+function _ransDecode(buf,off,nsyms,freqs){
+  const cum=new Int32Array(257); for(let s=0;s<256;s++)cum[s+1]=cum[s]+freqs[s];
+  const c2s=new Uint8Array(_RC_M); for(let s=0;s<256;s++)for(let i=cum[s];i<cum[s+1];i++)c2s[i]=s;
+  let p=off, x=(buf[p]|(buf[p+1]<<8)|(buf[p+2]<<16)|(buf[p+3]<<24))>>>0; p+=4;
+  const out=new Uint8Array(nsyms);
+  for(let i=0;i<nsyms;i++){ const slot=x&(_RC_M-1), s=c2s[slot];
+    x=(freqs[s]*(x>>>_RC_SCALE)+slot-cum[s])>>>0;
+    while(x<_RC_L){ x=((x<<8)|buf[p++])>>>0; } out[i]=s; }
+  return {out,off:p};
+}
+function _decStream(s,buf,ctx){
+  const N=ctx.N,NF=ctx.NF,K=s.K,total=N*NF*K, zz=new Float64Array(total);
+  for(let pl=0;pl<s.nplanes;pl++){ const pm=s.planes[pl], freqs=new Int32Array(256);
+    for(let i=0;i<256;i++)freqs[i]=buf[ctx.off+i*2]|(buf[ctx.off+i*2+1]<<8); ctx.off+=512;
+    const r=_ransDecode(buf,ctx.off,pm.nsyms,freqs); ctx.off+=pm.blob_len;
+    const mul=Math.pow(2,8*pl); for(let i=0;i<total;i++)zz[i]+=r.out[i]*mul; }
+  const res=new Int32Array(total);
+  for(let i=0;i<total;i++){ const z=zz[i]; res[i]=(z%2?-((z+1)/2):(z/2)); }
+  const q=new Int32Array(total);
+  if(s.pred==="delta"){ for(let n=0;n<N;n++)for(let k=0;k<K;k++){ let acc=0; const b=(n*NF)*K+k;
+    for(let f=0;f<NF;f++){ acc+=res[b+f*K]; q[b+f*K]=acc; } } }
+  else { for(let n=0;n<N;n++)for(let k=0;k<K;k++){ const b=(n*NF)*K+k; q[b]=res[b];
+    if(NF>1)q[b+K]=res[b+K]+q[b]; for(let f=2;f<NF;f++)q[b+f*K]=res[b+f*K]+2*q[b+(f-1)*K]-q[b+(f-2)*K]; } }
+  return q;
+}
+function decodeFlipbookC(fileU8){
+  const dv=new DataView(fileU8.buffer,fileU8.byteOffset,fileU8.byteLength);
+  const jlen=dv.getUint32(0,true);
+  const meta=JSON.parse(new TextDecoder().decode(fileU8.subarray(4,4+jlen)));
+  const N=meta.nsplats,NF=meta.nframes,ctx={N,NF,off:4+jlen};
+  const cpu=[]; for(let f=0;f<NF;f++)cpu.push(new Float32Array(N*_RC_CH));
+  let qkeep=null,qidx=null;
+  for(const s of meta.streams){
+    const q=_decStream(s,fileU8,ctx),K=s.K,step=s.step;
+    if(s.name==="quat"){ qkeep={q,step}; continue; }
+    if(s.name==="quat_idx"){ qidx=q; continue; }
+    const isScale=(s.name==="scale");
+    for(let n=0;n<N;n++)for(let f=0;f<NF;f++){ const b=((n*NF)+f)*K;
+      for(let k=0;k<K;k++){ let v=q[b+k]*step; if(isScale)v=Math.exp(v); cpu[f][n*_RC_CH+s.ch[k]]=v; } }
+  }
+  if(qkeep){ const step=qkeep.step;
+    for(let n=0;n<N;n++)for(let f=0;f<NF;f++){ const bk=((n*NF)+f)*3, bi=((n*NF)+f);
+      const a=qkeep.q[bk]*step,b2=qkeep.q[bk+1]*step,c=qkeep.q[bk+2]*step;
+      const drop=Math.sqrt(Math.max(0,1-(a*a+b2*b2+c*c))), di=qidx[bi];
+      const comps=[a,b2,c], full=[0,0,0,0]; let j=0;
+      for(let m=0;m<4;m++){ full[m]=(m===di)?drop:comps[j++]; }
+      const o=n*_RC_CH+6; cpu[f][o]=full[0];cpu[f][o+1]=full[1];cpu[f][o+2]=full[2];cpu[f][o+3]=full[3]; } }
+  // optional embedded audio = the bytes right after the payload (ctx.off now points there)
+  let audio=null;
+  if(meta.audio&&meta.audio.len>0){ audio={bytes:fileU8.slice(ctx.off,ctx.off+meta.audio.len),type:meta.audio.type||'audio/mpeg'}; }
+  return {NF,N,FPS:meta.fps,STRIDE:meta.stride,flip:meta.flip,cpu,audio};
+}
+
+async function load(){
+  // ---- range-coded .mint: download + range-decode to per-frame Float32 buffers ----
+  // choose file via ?mint=NAME  (default flipbook_c.mint); NAME under /MINT_DATA/ unless an absolute path/url
+  // pick file via ?m=NAME (or ?mint=); default HB_180_Full; ".mint" auto-appended; bare name -> /MINT_DATA/
+  const _q=new URLSearchParams(location.search);
+  // default sequence streams from R2 (CORS-enabled). ?m=<name|url> overrides (bare name -> /MINT_DATA/ for local dev).
+  const R2_BASE='https://pub-74912f96f8a84c0db42d38800266b931.r2.dev/SEQUENCES/';
+  let _mp=_q.get('m')||_q.get('mint')||(R2_BASE+'STMTP_390.mint');
+  if(!/\.mint$/i.test(_mp)&&!/^(https?:|\/)/.test(_mp)) _mp+='.mint';
+  const _murl=(/^(https?:|\/)/.test(_mp)?_mp:'/MINT_DATA/'+_mp);
+  mintName=_mp.replace(/^.*[\/]/,'').replace(/\.mint$/i,'');     // for the grade file name
+  document.getElementById('gName').textContent='file: '+mintName+'.grade.json';
+  loadGrade(mintName);                                          // auto-apply a saved grade if present
+  setLoad('downloading '+_mp+' (0%)');
+  const resp=await fetch(_murl+'?_='+Date.now());
+  const total=+(resp.headers.get('Content-Length')||0);
+  const reader=resp.body.getReader();const chunks=[];let recv=0;
+  for(;;){const{done,value}=await reader.read();if(done)break;chunks.push(value);recv+=value.length;
+    if(total)setLoad('downloading '+((recv/total*100)|0)+'%');}
+  let file=new Uint8Array(recv);{let o=0;for(const c of chunks){file.set(c,o);o+=c.length;}}
+  setLoad('decoding (range coder)...');
+  const dec=decodeFlipbookC(file);
+  NF=dec.NF;N=dec.N;FPS=dec.FPS;STRIDE=dec.STRIDE;
+  for(let f=0;f<NF;f++)cpu.push(dec.cpu[f]);
+  if(dec.audio){ const blob=new Blob([dec.audio.bytes],{type:dec.audio.type});
+    audioEl=new Audio(URL.createObjectURL(blob)); audioEl.preload='auto'; audioEl.loop=true; window.__hasAudio=true; window.__audio=audioEl;
+    playing=false; const pb=document.getElementById('play'); if(pb)pb.innerHTML='&#9654;'; }  // start paused -> 1st gesture starts A+V in sync (autoplay-audio is blocked anyway)
+  // center = mean of frame-0 positions; also feet = global min-Y across ALL frames (ignore transparent
+  // padding splats: opa<=0). Used to drop the model so FEET sit on the street at world y=0.
+  {let sx=0,sy=0,sz=0,cnt=0;const a=cpu[0];
+   for(let i=0;i<N;i++){if(a[i*14+13]<=0.0)continue;sx+=a[i*14];sy+=a[i*14+1];sz+=a[i*14+2];cnt++;}
+   center=[sx/cnt,sy/cnt,sz/cnt];}
+  // ROBUST feet level: a low percentile of EARLY (standing) frames' Y, not the absolute min over all
+  // 180 frames (a deep crouch or a single stray low splat there would set feet too low -> standing
+  // frames float). Use frames 0-3 (the performer is upright at the start), 0.5th percentile = feet.
+  {const ys=[];const F=Math.min(4,NF);
+   for(let f=0;f<F;f++){const a=cpu[f];for(let i=0;i<N;i++){if(a[i*14+13]<=0.05)continue;ys.push(a[i*14+1]);}}
+   ys.sort((p,q)=>p-q);
+   feetY=ys[Math.floor(ys.length*0.005)];                 // 0.5th pct = robust ground contact
+   const topY=ys[Math.floor(ys.length*0.999)]; bodyH=topY-feetY;}
+  groundOff=[-center[0], -feetY, -center[2]];   // x,z centered over origin; feet to y=0
+  window.__grounded={method:'frame0-3 0.5pct feet',feetY:0.0,bodyH:+bodyH.toFixed(3)};
+  // load the HDRi street dome (same asset as demo) in parallel-ish (after parse, before play)
+  setLoad('loading HDRi street...');
+  try{ envTex=await loadHDR('/assets/wide_street_02_2k.hdr'); window.__hdri='wide_street_02_2k.hdr'; }
+  catch(e){ console.warn('HDR load failed',e); window.__hdri='(failed)'; }
+  // pre-sort + upload every frame from default camera
+  setLoad('uploading to GPU 0%');
+  computeDefaultView();
+  // Allocate one DYNAMIC_DRAW VBO per frame with raw splat data. Draw order is fixed each tick by
+  // re-sorting the ACTIVE frame in-place (bufferSubData) for the live camera (see ensureSorted).
+  for(let f=0;f<NF;f++){
+    const vbo=gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER,vbo);gl.bufferData(gl.ARRAY_BUFFER,cpu[f],gl.DYNAMIC_DRAW);
+    vbos.push(vbo);
+    if((f%10)===0)setLoad('uploading to GPU '+((f/NF*100)|0)+'%');
+  }
+  document.getElementById('seek').max=NF-1;
+  document.getElementById('lbl').textContent='0/'+NF;
+  document.getElementById('load').style.display='none';
+  window.__loaded=true;
+}
+
+// ----- sort: back-to-front by current view-space z, write reordered interleaved into dst -----
+// 16-bit LSD radix sort over quantized depth (two passes, no per-call allocation, no comparator
+// boxing) -> ~0.5-1.5ms for 38k splats; ascending depth = back-to-front (cam z is negative in front).
+let _depth=null,_key=null,_ord=null,_ord2=null,_c=null;
+function sortInto(src,dst,view){
+  if(!_depth||_depth.length<N){_depth=new Float32Array(N);_key=new Uint32Array(N);
+    _ord=new Uint32Array(N);_ord2=new Uint32Array(N);_c=new Uint32Array(65536);}
+  const v2=view[2],v6=view[6],v10=view[10],v14=view[14];
+  let dmin=Infinity,dmax=-Infinity;
+  for(let i=0;i<N;i++){const b=i*14;const d=v2*src[b]+v6*src[b+1]+v10*src[b+2]+v14;_depth[i]=d;if(d<dmin)dmin=d;if(d>dmax)dmax=d;}
+  const scale=(dmax>dmin)?4294967295/(dmax-dmin):0;   // map depth -> 32-bit key (ascending)
+  for(let i=0;i<N;i++){_key[i]=((_depth[i]-dmin)*scale)>>>0;_ord[i]=i;}
+  // pass 1: low 16 bits
+  let c=_c;c.fill(0);for(let i=0;i<N;i++)c[_key[_ord[i]]&0xFFFF]++;
+  for(let s=0,i=0;i<65536;i++){const t=c[i];c[i]=s;s+=t;}
+  for(let i=0;i<N;i++){const o=_ord[i];_ord2[c[_key[o]&0xFFFF]++]=o;}
+  // pass 2: high 16 bits
+  c.fill(0);for(let i=0;i<N;i++)c[(_key[_ord2[i]]>>>16)&0xFFFF]++;
+  for(let s=0,i=0;i<65536;i++){const t=c[i];c[i]=s;s+=t;}
+  for(let i=0;i<N;i++){const o=_ord2[i];_ord[c[(_key[o]>>>16)&0xFFFF]++]=o;}
+  // gather interleaved splat records in sorted (back-to-front) order
+  for(let k=0;k<N;k++){const i=_ord[k];let s=i*14,d=k*14;
+    dst[d]=src[s];dst[d+1]=src[s+1];dst[d+2]=src[s+2];dst[d+3]=src[s+3];dst[d+4]=src[s+4];
+    dst[d+5]=src[s+5];dst[d+6]=src[s+6];dst[d+7]=src[s+7];dst[d+8]=src[s+8];dst[d+9]=src[s+9];
+    dst[d+10]=src[s+10];dst[d+11]=src[s+11];dst[d+12]=src[s+12];dst[d+13]=src[s+13];}
+}
+
+// ----- camera -----
+let yaw=0,pitch=0,dist=3.0,tgt=[0,0,0];
+let vboCamView=null;
+function mat4mul(a,b){const o=new Float32Array(16);for(let i=0;i<4;i++)for(let j=0;j<4;j++){let s=0;for(let k=0;k<4;k++)s+=a[k*4+j]*b[i*4+k];o[i*4+j]=s;}return o;}
+function persp(fov,asp,n,f){const t=1/Math.tan(fov/2);return new Float32Array([t/asp,0,0,0, 0,t,0,0, 0,0,(f+n)/(n-f),-1, 0,0,2*f*n/(n-f),0]);}
+function lookAt(e,c,u){const f=norm(sub(c,e)),s=norm(cross(f,u)),v=cross(s,f);return new Float32Array([s[0],v[0],-f[0],0, s[1],v[1],-f[1],0, s[2],v[2],-f[2],0, -dot(s,e),-dot(v,e),dot(f,e),1]);}
+const sub=(a,b)=>[a[0]-b[0],a[1]-b[1],a[2]-b[2]],cross=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]],dot=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2],norm=a=>{const l=Math.hypot(...a);return[a[0]/l,a[1]/l,a[2]/l];};
+function camPos(){return [tgt[0]+dist*Math.cos(pitch)*Math.sin(yaw),tgt[1]+dist*Math.sin(pitch),tgt[2]+dist*Math.cos(pitch)*Math.cos(yaw)];}
+// keep the camera AT or ABOVE the ground plane: camPos.y = tgt.y + dist*sin(pitch) >= GROUND_EPS.
+// lowest orbit = grazing the street (~0deg, looking slightly up at the body); never under the floor looking up.
+const GROUND_EPS=0.03;
+function clampPitch(){
+  const lo=Math.asin(Math.max(-1,Math.min(1,(GROUND_EPS-tgt[1])/Math.max(dist,1e-3))));
+  pitch=Math.max(lo, Math.min(1.45, pitch));
+}
+const FOV=50*Math.PI/180;   // demo 'Street Dome' camera fov
+function computeDefaultView(){
+  // model is grounded (feet at y=0, centered in x/z). Frame like the demo: focus at mid-body,
+  // azimuth ~0.8pi (3/4 back), elevation ~0.35, distance scaled to body height.
+  // focus a bit below mid-body and a lower elevation -> demo-like eye level, feet contact in view.
+  tgt=[0, bodyH*0.42, 0];
+  yaw=Math.PI*0.8; pitch=0.18; dist=bodyH*1.5;
+  vboCamView=lookAt(camPos(),tgt,[0,1,0]);
+}
+
+// Gaussian alpha blending needs back-to-front order from the CURRENT camera for EVERY displayed
+// frame. The pose changes each frame and the camera orbits, so a static load-time order goes stale
+// -> wrong occlusion / see-through. FIX: re-sort the active frame by the live view whenever the
+// displayed frame index OR the camera changed since the last sort, then bufferSubData into its VBO.
+const _scratch=()=>{ if(!sortScratch||sortScratch.length<N*14)sortScratch=new Float32Array(N*14); return sortScratch;};
+let sortScratch=null;
+let sortedFrame=-1, sortedYaw=1e9, sortedPitch=1e9, sortedDist=1e9, lastSortMs=0;
+function resortCurrent(view){
+  const t0=performance.now();
+  const s=_scratch();sortInto(cpu[cur],s,view);
+  gl.bindBuffer(gl.ARRAY_BUFFER,vbos[cur]);gl.bufferSubData(gl.ARRAY_BUFFER,0,s);
+  sortedFrame=cur; sortedYaw=yaw; sortedPitch=pitch; sortedDist=dist;
+  lastSortMs=performance.now()-t0; window.__sortMs=lastSortMs;
+}
+// re-sort the active frame if frame changed OR camera moved since its last sort
+function ensureSorted(view){
+  const camMoved=sortedYaw!==yaw||sortedPitch!==pitch||sortedDist!==dist;
+  if(cur!==sortedFrame||camMoved) resortCurrent(view);
+}
+
+function mat4inv(m){
+  const o=new Float32Array(16);
+  const a00=m[0],a01=m[1],a02=m[2],a03=m[3],a10=m[4],a11=m[5],a12=m[6],a13=m[7],
+        a20=m[8],a21=m[9],a22=m[10],a23=m[11],a30=m[12],a31=m[13],a32=m[14],a33=m[15];
+  const b00=a00*a11-a01*a10,b01=a00*a12-a02*a10,b02=a00*a13-a03*a10,b03=a01*a12-a02*a11,
+        b04=a01*a13-a03*a11,b05=a02*a13-a03*a12,b06=a20*a31-a21*a30,b07=a20*a32-a22*a30,
+        b08=a20*a33-a23*a30,b09=a21*a32-a22*a31,b10=a21*a33-a23*a31,b11=a22*a33-a23*a32;
+  let det=b00*b11-b01*b10+b02*b09+b03*b08-b04*b07+b05*b06; if(!det)return o; det=1/det;
+  o[0]=(a11*b11-a12*b10+a13*b09)*det;o[1]=(a02*b10-a01*b11-a03*b09)*det;o[2]=(a31*b05-a32*b04+a33*b03)*det;o[3]=(a22*b04-a21*b05-a23*b03)*det;
+  o[4]=(a12*b08-a10*b11-a13*b07)*det;o[5]=(a00*b11-a02*b08+a03*b07)*det;o[6]=(a32*b02-a30*b05-a33*b01)*det;o[7]=(a20*b05-a22*b02+a23*b01)*det;
+  o[8]=(a10*b10-a11*b08+a13*b06)*det;o[9]=(a01*b08-a00*b10-a03*b06)*det;o[10]=(a30*b04-a31*b02+a33*b00)*det;o[11]=(a21*b02-a20*b04-a23*b00)*det;
+  o[12]=(a11*b07-a10*b09-a12*b06)*det;o[13]=(a00*b09-a01*b07+a02*b06)*det;o[14]=(a31*b01-a30*b03-a32*b00)*det;o[15]=(a20*b03-a21*b01+a22*b00)*det;
+  return o;
+}
+
+function draw(view,proj){
+  const cv=gl.canvas,dpr=Math.min(2,devicePixelRatio||1);const W=cv.clientWidth*dpr,H=cv.clientHeight*dpr;
+  if(cv.width!=W){cv.width=W;cv.height=H;}gl.viewport(0,0,W,H);
+  gl.clearColor(0.04,0.05,0.07,1);gl.clear(gl.COLOR_BUFFER_BIT);
+  if(!window.__loaded)return;
+  const cp=camPos();
+  // ---- 1) HDRi street dome background (fullscreen, equirect by view-dir, ACES+exposure) ----
+  if(SHOW_ENV&&envTex){
+    gl.disable(gl.BLEND);
+    gl.useProgram(bgProg);
+    const invVP=mat4inv(mat4mul(proj,view));
+    gl.uniformMatrix4fv(u_InvVP,false,invVP);gl.uniform3f(u_CamPos,cp[0],cp[1],cp[2]);
+    gl.uniform1f(u_bgExp,EXPOSURE);gl.uniform1f(u_bgRot,SKY_ROT);gl.uniform1f(u_bgGExp,GND_EXP);gl.uniform1f(u_bgHeight,GND_HEIGHT);gl.uniform1f(u_bgR,SKY_R);
+    gl.activeTexture(gl.TEXTURE0);gl.bindTexture(gl.TEXTURE_2D,envTex);gl.uniform1i(u_Env,0);
+    gl.bindBuffer(gl.ARRAY_BUFFER,bgQuad);gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);gl.vertexAttribDivisor(0,0);
+    gl.drawArrays(gl.TRIANGLES,0,3);
+    gl.enable(gl.BLEND);
+  }
+  // (1b) separate finite ground plane REMOVED — the grounded-skybox background (pass 1) now renders the
+  // infinite floor, so there's no plane edge / duplicate world when zoomed out. The shadow draws over it.
+  // ---- 2) contact shadow: active frame's splats flattened to y=0, dark + soft + low alpha ----
+  if(SHOW_ENV){
+    gl.blendFuncSeparate(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA,gl.ONE,gl.ONE_MINUS_SRC_ALPHA);
+    gl.useProgram(shProg);
+    gl.bindBuffer(gl.ARRAY_BUFFER,vbos[cur]);
+    gl.enableVertexAttribArray(1);gl.vertexAttribPointer(1,3,gl.FLOAT,false,BYTES,0);gl.vertexAttribDivisor(1,1);
+    gl.enableVertexAttribArray(2);gl.vertexAttribPointer(2,3,gl.FLOAT,false,BYTES,3*4);gl.vertexAttribDivisor(2,1);
+    gl.enableVertexAttribArray(5);gl.vertexAttribPointer(5,1,gl.FLOAT,false,BYTES,13*4);gl.vertexAttribDivisor(5,1);
+    gl.bindBuffer(gl.ARRAY_BUFFER,quad);gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);gl.vertexAttribDivisor(0,0);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,idxBuf);
+    gl.uniformMatrix4fv(sh_uView,false,view);gl.uniformMatrix4fv(sh_uProj,false,proj);
+    gl.uniform2f(sh_uVP,W,H);gl.uniform3f(sh_uGround,groundOff[0],groundOff[1],groundOff[2]);
+    gl.uniform1f(sh_uY,0.005);gl.uniform1f(sh_uBlur,bodyH*0.006);gl.uniform1f(sh_uDark,0.6);gl.uniform2f(sh_uSun,SUN_OFF[0],SUN_OFF[1]);
+    gl.drawElementsInstanced(gl.TRIANGLES,6,gl.UNSIGNED_SHORT,0,N);
+    gl.blendFuncSeparate(gl.ONE,gl.ONE_MINUS_SRC_ALPHA,gl.ONE,gl.ONE_MINUS_SRC_ALPHA);
+  }
+  // ---- 3) the splats (grounded + ACES tonemapped) ----
+  gl.useProgram(prog);
+  bindFrameVBO(vbos[cur]);
+  gl.bindBuffer(gl.ARRAY_BUFFER,quad);gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);gl.vertexAttribDivisor(0,0);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,idxBuf);
+  gl.uniformMatrix4fv(uView,false,view);gl.uniformMatrix4fv(uProj,false,proj);
+  const f=H/(2*Math.tan(FOV/2));gl.uniform2f(uFocal,f,f);gl.uniform2f(uViewport,W,H);
+  gl.uniform3f(uGroundOff,groundOff[0],groundOff[1],groundOff[2]);
+  gl.uniform1f(uExposure,SHOW_ENV?MODEL_BRIGHT:1.0);   // model albedo is already display-encoded; ~1.05 to match demo
+  setGradeUniforms();                                  // live color grade + de-spike
+  gl.drawElementsInstanced(gl.TRIANGLES,6,gl.UNSIGNED_SHORT,0,N);
+}
+
+// ----- play loop: render at rAF (~60fps), advance playback at 25fps via accumulator -----
+let last=performance.now(),acc=0,fpsT=last,fpsC=0;
+function loop(t){
+  if(inXR){ return; }          // WebXR session drives its own frame loop (onXRFrame); pause the desktop rAF
+  const dt=t-last;last=t;
+  if(window.__loaded){
+    if(playing){
+      if(audioEl&&!audioEl.paused){ cur=Math.min(NF-1,Math.floor(audioEl.currentTime*FPS)); } // audio is master
+      else { acc+=dt;const step=1000/FPS; while(acc>=step){cur=(cur+1)%NF;acc-=step;} }
+      document.getElementById('seek').value=cur;
+      document.getElementById('lbl').textContent=cur+'/'+NF;
+    }
+    window.__frame=cur;window.__playing=playing;
+  }
+  const cv=gl.canvas,dpr=Math.min(2,devicePixelRatio||1);const W=cv.clientWidth*dpr,H=cv.clientHeight*dpr;
+  const view=lookAt(camPos(),tgt,[0,1,0]);const proj=persp(FOV,W/H,0.02,1000);
+  if(window.__loaded){
+    // ALWAYS keep the displayed frame depth-sorted for the live camera (correct occlusion every
+    // frame + every angle). Only actually re-sorts when frame or camera changed since last sort.
+    ensureSorted(view);
+  }
+  draw(view,proj);
+  fpsC++;if(t-fpsT>500){document.getElementById('fps2').textContent=(fpsC*1000/(t-fpsT)|0)+'fps';fpsC=0;fpsT=t;}
+  requestAnimationFrame(loop);
+}
+
+// ----- input -----
+const cv=gl.canvas;let drag=false,px,py;
+cv.onmousedown=e=>{drag=true;px=e.clientX;py=e.clientY;};
+window.onmouseup=()=>{drag=false;};
+window.onmousemove=e=>{if(!drag)return;yaw-=(e.clientX-px)*0.008;pitch+=(e.clientY-py)*0.008;clampPitch();px=e.clientX;py=e.clientY;};
+cv.onwheel=e=>{e.preventDefault();dist*=Math.exp(e.deltaY*0.001);clampPitch();};
+function togglePlay(){ playing=!playing; const b=document.getElementById('play'); if(b)b.innerHTML=playing?'&#10074;&#10074;':'&#9654;';
+  if(audioEl){ if(playing){ if(Math.abs(audioEl.currentTime-cur/FPS)>0.15)audioEl.currentTime=cur/FPS; audioEl.play().catch(()=>{}); } else audioEl.pause(); } }
+document.getElementById('play').onclick=function(){togglePlay();this.blur();};   // blur so Spacebar won't double-toggle via the focused button
+document.getElementById('seek').oninput=e=>{cur=+e.target.value;playing=false;acc=0;document.getElementById('play').innerHTML='&#9654;';document.getElementById('lbl').textContent=cur+'/'+NF;if(audioEl){audioEl.pause();audioEl.currentTime=cur/FPS;}};
+
+// expose API for puppeteer
+window.__player={get frame(){return cur;},get nframes(){return NF;},get playing(){return playing;},
+  get fps(){return FPS;},seek(i){cur=i%NF;},play(){playing=true;},pause(){playing=false;},
+  setCam(y,p,d){yaw=y;pitch=p;if(d!=null)dist=d;clampPitch();},
+  get cam(){return {yaw,pitch,dist};},
+  setEnv(on){SHOW_ENV=!!on;}, get env(){return SHOW_ENV;}, get bodyH(){return bodyH;}};
+// ---- grade panel (sliders built from GRADE_DEFS; save -> <mint>.grade.json; auto-loaded on startup) ----
+let mintName='grade';
+function buildGradePanel(){ const rows=document.getElementById('gradeRows'); rows.innerHTML='';
+  GRADE_DEFS.forEach(d=>{ const[k,lab,mn,mx,st]=d; const r=document.createElement('div'); r.className='row';
+    r.innerHTML='<label>'+lab+'</label><input type=range min='+mn+' max='+mx+' step='+st+' id=g_'+k+'><span class=v id=gv_'+k+'></span>';
+    rows.appendChild(r); const inp=r.querySelector('input'),vv=r.querySelector('.v');
+    inp.value=grade[k]; vv.textContent=(+grade[k]).toFixed(2);
+    inp.oninput=()=>{ grade[k]=+inp.value; vv.textContent=(+grade[k]).toFixed(2); }; }); }
+function applyGradeToSliders(){ GRADE_DEFS.forEach(d=>{const k=d[0],i=document.getElementById('g_'+k),v=document.getElementById('gv_'+k);
+  if(i){i.value=grade[k];v.textContent=(+grade[k]).toFixed(2);}}); }
+function resetGrade(){ GRADE_DEFS.forEach(d=>grade[d[0]]=d[5]); applyGradeToSliders(); }
+function saveGrade(){ const js=JSON.stringify(grade,null,2); const el=document.getElementById('gName');
+  // save straight into MINT_DATA via the server; fall back to a browser download if that fails
+  fetch('/grade/'+encodeURIComponent(mintName),{method:'POST',headers:{'Content-Type':'application/json'},body:js})
+    .then(r=>r.ok?r.json():Promise.reject()).then(j=>{ el.textContent='saved -> '+j.path; })
+    .catch(()=>{ const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([js],{type:'application/json'}));
+      a.download=mintName+'.grade.json'; document.body.appendChild(a); a.click(); a.remove();
+      el.textContent='downloaded '+mintName+'.grade.json (move into MINT_DATA)'; }); }
+async function loadGrade(name){ try{ const r=await fetch('/MINT_DATA/'+name+'.grade.json?_='+Date.now());
+  if(r.ok){ Object.assign(grade,await r.json()); applyGradeToSliders(); window.__grade='loaded'; } else window.__grade='default'; }
+  catch(e){ window.__grade='default'; } }
+buildGradePanel();
+document.getElementById('gSave').onclick=saveGrade;
+document.getElementById('gReset').onclick=resetGrade;
+
+window.addEventListener('keydown',e=>{
+  if(e.code==='Space'||e.key===' '){ e.preventDefault(); togglePlay(); }   // Spacebar = play/pause (any focus)
+  else if(e.key==='h'||e.key==='H'){ SHOW_ENV=!SHOW_ENV; }
+  else if(e.key==='g'||e.key==='G'){ const p=document.getElementById('grade'); p.style.display=(p.style.display==='block')?'none':'block'; }
+});
+// expose grade API for tooling
+window.__player.getGrade=()=>JSON.parse(JSON.stringify(grade));
+window.__player.setGrade=(g)=>{Object.assign(grade,g);applyGradeToSliders();};
+
+// ================= WebXR immersive-AR (plays the SAME .mint, anchored on a real floor) =================
+let inXR=false, xrSession=null, xrRefSpace=null, xrHitSource=null, glLayer=null, arSupported=false;
+let placed=false, placeMat=null, reticleMat=null, modelScale=1.0, modelYaw=0, _xrLast=0, _xrAcc=0;
+// reticle: a thin glowing ring on the detected floor
+const RET_VS=`#version 300 es
+precision highp float; uniform mat4 uMVP; layout(location=0) in vec2 p; out vec2 vp;
+void main(){ vp=p; gl_Position=uMVP*vec4(p.x*0.13,0.002,p.y*0.13,1.0); }`;
+const RET_FS=`#version 300 es
+precision highp float; in vec2 vp; out vec4 o;
+void main(){ float r=length(vp); float ring=smoothstep(1.0,0.9,r)*(1.0-smoothstep(0.6,0.72,r)); if(ring<0.02)discard; o=vec4(0.1,0.92,1.0,ring*0.85); }`;
+const retProg=gl.createProgram();gl.attachShader(retProg,sh(gl.VERTEX_SHADER,RET_VS));gl.attachShader(retProg,sh(gl.FRAGMENT_SHADER,RET_FS));gl.linkProgram(retProg);
+const ret_uMVP=gl.getUniformLocation(retProg,'uMVP');
+const retQuad=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,retQuad);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,1,-1,1,1,-1,1]),gl.STATIC_DRAW);
+
+function buildModel(P,s,yaw){ // P=floor pose (col-major) ; model = P * (Ry(yaw)*scale)
+  const c=Math.cos(yaw),sn=Math.sin(yaw);
+  const RS=new Float32Array([c*s,0,-sn*s,0, 0,s,0,0, sn*s,0,c*s,0, 0,0,0,1]);
+  return mat4mul(P,RS);
+}
+function sortXR(mv){ const sc=_scratch(); sortInto(cpu[cur],sc,mv); gl.bindBuffer(gl.ARRAY_BUFFER,vbos[cur]); gl.bufferSubData(gl.ARRAY_BUFFER,0,sc); }
+function drawSplatsXR(mv,proj,fx,fy,vpW,vpH){
+  gl.useProgram(prog); bindFrameVBO(vbos[cur]);
+  gl.bindBuffer(gl.ARRAY_BUFFER,quad);gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);gl.vertexAttribDivisor(0,0);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,idxBuf);
+  gl.blendFuncSeparate(gl.ONE,gl.ONE_MINUS_SRC_ALPHA,gl.ONE,gl.ONE_MINUS_SRC_ALPHA);
+  gl.uniformMatrix4fv(uView,false,mv);gl.uniformMatrix4fv(uProj,false,proj);
+  gl.uniform2f(uFocal,fx,fy);gl.uniform2f(uViewport,vpW,vpH);
+  gl.uniform3f(uGroundOff,groundOff[0],groundOff[1],groundOff[2]);
+  gl.uniform1f(uExposure,1.0); setGradeUniforms();
+  gl.drawElementsInstanced(gl.TRIANGLES,6,gl.UNSIGNED_SHORT,0,N);
+}
+function drawReticle(mvp){
+  gl.useProgram(retProg); gl.bindBuffer(gl.ARRAY_BUFFER,retQuad);
+  gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);gl.vertexAttribDivisor(0,0);
+  gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,idxBuf);
+  gl.blendFuncSeparate(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA,gl.ONE,gl.ONE_MINUS_SRC_ALPHA);
+  gl.uniformMatrix4fv(ret_uMVP,false,mvp); gl.drawElements(gl.TRIANGLES,6,gl.UNSIGNED_SHORT,0);
+}
+async function enterAR(){
+  if(inXR||!navigator.xr) return;
+  try{ xrSession=await navigator.xr.requestSession('immersive-ar',
+        {requiredFeatures:['hit-test'], optionalFeatures:['local-floor','dom-overlay','light-estimation'],
+         domOverlay:{root:document.getElementById('xrOverlay')}}); }
+  catch(e){ alert('Could not start AR: '+e.message); return; }
+  inXR=true; SHOW_ENV=false; playing=true; placed=false; modelScale=1; modelYaw=0; _xrLast=0; _xrAcc=0;
+  document.getElementById('enterAR').style.display='none';
+  const hint=document.getElementById('arHint'); hint.style.display='block'; hint.textContent='Point at the floor, then tap to place';
+  glLayer=new XRWebGLLayer(xrSession,gl); xrSession.updateRenderState({baseLayer:glLayer});
+  xrRefSpace=await xrSession.requestReferenceSpace('local-floor').catch(()=>xrSession.requestReferenceSpace('local'));
+  const vsp=await xrSession.requestReferenceSpace('viewer');
+  xrHitSource=await xrSession.requestHitTestSource({space:vsp});
+  xrSession.addEventListener('select',()=>{ if(reticleMat){ placeMat=reticleMat.slice(); placed=true;
+      hint.textContent='Pinch = scale · two-finger twist = turn · tap = move'; } });
+  xrSession.addEventListener('end',()=>{ inXR=false; xrSession=null; xrHitSource=null; placed=false;
+      hint.style.display='none'; if(arSupported)document.getElementById('enterAR').style.display='block';
+      last=performance.now(); requestAnimationFrame(loop); });
+  xrSession.requestAnimationFrame(onXRFrame);
+}
+function onXRFrame(t,frame){
+  const session=frame.session, pose=frame.getViewerPose(xrRefSpace);
+  if(playing&&window.__loaded){ if(!_xrLast)_xrLast=t; _xrAcc+=(t-_xrLast); _xrLast=t;
+    const step=1000/FPS; while(_xrAcc>=step){ cur=(cur+1)%NF; _xrAcc-=step; } window.__frame=cur; }
+  if(!placed&&xrHitSource){ const hits=frame.getHitTestResults(xrHitSource);
+    if(hits.length){ const hp=hits[0].getPose(xrRefSpace); if(hp) reticleMat=hp.transform.matrix; } }
+  if(pose){
+    gl.bindFramebuffer(gl.FRAMEBUFFER,glLayer.framebuffer);
+    gl.clearColor(0,0,0,0); gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);  // transparent -> camera passthrough
+    for(const view of pose.views){
+      const vp=glLayer.getViewport(view); gl.viewport(vp.x,vp.y,vp.width,vp.height);
+      const proj=view.projectionMatrix, viewMat=view.transform.inverse.matrix;
+      const fx=proj[0]*vp.width/2, fy=proj[5]*vp.height/2;
+      if(placed&&placeMat&&window.__loaded){
+        const mv=mat4mul(viewMat, buildModel(placeMat,modelScale,modelYaw));
+        sortXR(mv); drawSplatsXR(mv,proj,fx,fy,vp.width,vp.height);
+      } else if(reticleMat){
+        drawReticle(mat4mul(proj, mat4mul(viewMat, reticleMat)));
+      }
+    }
+  }
+  session.requestAnimationFrame(onXRFrame);
+}
+// two-finger pinch = scale, twist = yaw (single-finger tap passes through to WebXR `select`)
+let _pinch=null;
+window.addEventListener('touchmove',e=>{ if(!inXR||e.touches.length!==2)return; e.preventDefault();
+  const dx=e.touches[0].clientX-e.touches[1].clientX, dy=e.touches[0].clientY-e.touches[1].clientY;
+  const d=Math.hypot(dx,dy), a=Math.atan2(dy,dx);
+  if(_pinch){ modelScale=Math.max(0.15,Math.min(10,modelScale*(d/_pinch.d))); modelYaw+=(a-_pinch.a); }
+  _pinch={d,a};
+},{passive:false});
+window.addEventListener('touchend',e=>{ if(e.touches.length<2)_pinch=null; });
+// show the AR button only where immersive-ar is actually available (Android Chrome / ARCore)
+if(navigator.xr&&navigator.xr.isSessionSupported){
+  navigator.xr.isSessionSupported('immersive-ar').then(ok=>{ arSupported=ok;
+    if(ok){ const b=document.getElementById('enterAR'); b.style.display='block'; b.onclick=enterAR; } }).catch(()=>{});
+}
+
+load().then(()=>{requestAnimationFrame(loop);}).catch(e=>{setLoad('ERR '+e.message);console.error(e);});
+requestAnimationFrame(loop); // start rendering immediately (shows clear color while loading)
+</script></body></html>
