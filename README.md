@@ -13,7 +13,6 @@ Tab S9.
 ## Clips (all hosted on Cloudflare R2 `SEQUENCES/`)
 | name | file | notes |
 |---|---|---|
-| Fashion | `fashion.mint` | **Gracia streaming format — not playable by this viewer** (shows a message). Needs a flipbook re-export. |
 | LumiRF8 1350 | `LUMIRF8_1350.mint` | 1350 f, **embedded audio**, graded (`LUMIRF8_1350.grade.json`). 179 MB — heavy for a tablet. |
 | HB 180 | `HB_180_Full_HQ.mint` | 39k splats, 180 f, hi-fi. 52 MB. |
 | STMTP 390 | `STMTP_390_clean.mint` | 17k splats, 391 f, floaters clamped. Lightest — best for tablet AR. |

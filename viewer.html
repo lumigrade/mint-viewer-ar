@@ -22,14 +22,15 @@
 </style></head>
 <body>
 <canvas id="c"></canvas>
+<!-- WebXR dom-overlay renders ONLY this root's children over the AR view, so ALL AR-time UI lives in here -->
 <div id="xrOverlay" style="position:fixed;inset:0;pointer-events:none;z-index:7">
   <button id="shadowBtn" style="display:none;position:absolute;left:14px;top:14px;pointer-events:auto;background:#000b;color:#fff;border:1px solid #fff7;border-radius:22px;padding:10px 18px;font:600 14px system-ui">Shadow: On</button>
   <button id="backBtn" style="display:none;position:absolute;right:14px;top:14px;pointer-events:auto;background:#000b;color:#fff;border:1px solid #fff7;border-radius:22px;padding:10px 18px;font:600 14px system-ui">‹ Back</button>
+  <div id="arHint" style="position:absolute;left:0;right:0;bottom:104px;text-align:center;color:#fff;font:600 14px system-ui;text-shadow:0 1px 3px #000;display:none;pointer-events:none"></div>
+  <div id="recTime">● 0:00</div>
+  <button id="recBtn" title="Record video + mic"><span id="recDot"></span></button>
 </div>
 <button id="enterAR" style="position:fixed;left:50%;bottom:64px;transform:translateX(-50%);display:none;z-index:10;background:#0cf;color:#012;font:600 17px system-ui;border:0;border-radius:30px;padding:13px 30px;box-shadow:0 4px 18px #0006;cursor:pointer">▶ View in AR</button>
-<div id="arHint" style="position:fixed;left:0;right:0;bottom:14px;text-align:center;color:#fff;font:600 14px system-ui;text-shadow:0 1px 3px #000;display:none;z-index:8;pointer-events:none"></div>
-<div id="recTime">● 0:00</div>
-<button id="recBtn" title="Record video + mic"><span id="recDot"></span></button>
 <div id="load">loading 0%</div>
 <div id="grade"><h4>Grade <span style="color:#789;font-weight:normal">(press G)</span></h4><div id="gradeRows"></div>
  <button id="gSave">Save .grade.json</button> <button id="gReset">Reset</button>
@@ -39,7 +40,7 @@
 <script>
 const gl = document.getElementById('c').getContext('webgl2',{antialias:true,alpha:true,premultipliedAlpha:true,xrCompatible:true});
 gl.getExtension('EXT_color_buffer_float'); gl.getExtension('OES_texture_float_linear'); // float HDRi sampling
-// ----- shaders (reused from vp_player.html) + ground offset + ACES tonemap to match demo.gracia.ai -----
+// ----- shaders + ground offset + ACES tonemap (matched to the reference street-scene look) -----
 const VS=`#version 300 es
 precision highp float;
 uniform mat4 uView, uProj; uniform vec2 uFocal, uViewport; uniform vec3 uGroundOff; uniform float uAniso;
@@ -127,7 +128,7 @@ function setGradeUniforms(){ gl.useProgram(prog);
   gl.uniform1f(gU.gHue,grade.hue);gl.uniform1f(gU.gSat,grade.sat);gl.uniform3f(gU.gGain,grade.gr,grade.gg,grade.gb);
   gl.uniform1f(uAniso,grade.aniso); }
 
-// ============ HDRi STREET DOME background (equirect skybox) — same asset/exposure as demo.gracia.ai ============
+// ============ HDRi STREET DOME background (equirect skybox) ============
 const EXPOSURE=0.7;     // HDRi background ACES exposure (viewer_pc 'Street Dome' preset)
 const GND_EXP=1.05;     // ground floor exposure (a touch brighter -> lit street like the demo, less dark away from sun)
 const MODEL_BRIGHT=1.05;// splat albedo brightness (already display-encoded; ~1.0 = original/correct look)
@@ -368,12 +369,10 @@ async function load(){
   const total=+(resp.headers.get('Content-Length')||0);
   const reader=resp.body.getReader();const chunks=[];let recv=0;
   for(;;){const{done,value}=await reader.read();if(done)break;chunks.push(value);recv+=value.length;
-    // EARLY format check on the first bytes -> abort before downloading a big incompatible file (e.g. Fashion=276MB).
-    // Our flipbook .mint = [u32 json_len]["{"...]; the Gracia streaming .mint = a little-endian manifest (06 00 00 00…).
+    // EARLY format check on the first bytes -> abort before downloading a big incompatible file.
+    // A LumiGrade flipbook .mint begins with [u32 json_len]["{"...]; anything else is an unsupported format.
     if(recv>=5 && chunks.length===1 && chunks[0][4]!==0x7b){ reader.cancel();
-      const g=chunks[0][0]>0&&chunks[0][0]<64&&chunks[0][1]===0&&chunks[0][2]===0&&chunks[0][3]===0;
-      throw new Error(g ? 'This clip is in the Gracia streaming format, which this viewer can’t play yet — it needs a LumiGrade flipbook .mint.'
-                        : 'Not a .mint file. Check the URL.'); }
+      throw new Error('This file is not a supported LumiGrade .mint clip.'); }
     if(total)setLoad('downloading '+((recv/total*100)|0)+'%');}
   let file=new Uint8Array(recv);{let o=0;for(const c of chunks){file.set(c,o);o+=c.length;}}
   setLoad('decoding (range coder)...');
